@@ -27,26 +27,48 @@
   <a href="skills/codex-app-task-channel/SKILL.md">Skill Reference</a>
 </p>
 
-Codex App Task Channel provides the `codex-app-task-channel` skill. It is a
-backup for creating App-visible Codex tasks and communicating with them when
-the normal built-in task tools are absent or explicitly report that their
-dynamic handler is unavailable.
+Codex App Task Channel provides the `codex-app-task-channel` skill for two
+related purposes:
 
-The built-in task tools remain the default. This repository does not replace
-them, and it does not start a separate app-server daemon. Its helper connects
-to the Unix socket owned by the running Codex desktop app, so tasks remain
-visible in the app sidebar and share the app's task state.
+1. **Compatibility fallback.** It replaces unavailable App task operations
+   such as `create_thread` and `send_message_to_thread` when they are missing,
+   or when their advertised dynamic handler rejects the actual call.
+2. **App Server capability extension.** It exposes lower-level thread, turn,
+   and Session controls that the built-in task tools may not offer. Most
+   importantly, callers can select configuration per task instead of changing
+   one global Codex default for every task.
+
+Per-task controls include model, reasoning effort, service tier, working
+directory, context window, and auto-compaction threshold. This makes it
+possible, for example, to run a long-lived Sol monitoring task with one context
+window while creating Luna workers or independent tasks with a different
+window. Context settings are applied when creating/forking a task or at an
+eligible resume boundary, and remain subject to the selected model's supported
+maximum and effective-window adjustment.
+
+The built-in task tools remain the default for ordinary operations. Use this
+skill when those tools are unavailable or when they cannot express the required
+per-task configuration. The repository does not start a separate app-server
+daemon: its helper connects to the Unix socket owned by the running Codex
+desktop app, so tasks remain visible in the App sidebar and share the App's
+task state.
 
 ## Why This Exists
 
-Some Codex builds can advertise task tools such as `create_thread` or
-`send_message_to_thread` while the dynamic handler rejects the actual call.
-The CLI still exposes `codex agents` and `codex queue`, and the desktop app's
-own App Server supports the underlying thread and turn protocol.
+This project addresses two practical gaps:
 
-This skill packages a narrow fallback around that protocol. It preserves task
-visibility and history in the App while exposing explicit lifecycle,
-configuration, and delivery controls.
+- **Availability gap:** some Codex builds advertise task tools such as
+  `create_thread` or `send_message_to_thread`, but the dynamic handler is absent
+  or rejects the call.
+- **Configuration gap:** built-in task tools may support ordinary creation and
+  messaging without exposing Session settings such as a task-specific context
+  window or auto-compaction threshold.
+
+The desktop App Server already provides the underlying thread/turn lifecycle
+and configuration-override protocol. This skill packages those capabilities
+into a guarded helper that preserves App visibility and history, supports
+state-aware messaging, and verifies task-specific context configuration from
+runtime telemetry.
 
 The protocol and its thread/turn methods are documented in the
 [official Codex App Server guide](https://developers.openai.com/codex/app-server).
