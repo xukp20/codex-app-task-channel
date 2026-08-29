@@ -1,6 +1,11 @@
 <h1 align="center">Codex App Task Channel</h1>
 
 <p align="center">
+  <strong>English</strong> |
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <strong>A fallback task creation and messaging channel for the Codex desktop app.</strong>
 </p>
 
@@ -162,6 +167,7 @@ requirements, read the [Skill reference](skills/codex-app-task-channel/SKILL.md)
 ```text
 codex-app-task-channel/
 ├── README.md
+├── README.zh-CN.md
 ├── LICENSE
 ├── requirements.txt
 ├── tests/
