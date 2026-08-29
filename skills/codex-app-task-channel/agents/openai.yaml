@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex App Task Channel"
+  short_description: "Fallback App-visible task creation and messaging"
+  default_prompt: "Use $codex-app-task-channel when the normal Codex task tools are unavailable, and preserve built-in-first behavior."
