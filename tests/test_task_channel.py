@@ -88,7 +88,7 @@ class MessageContractTests(unittest.TestCase):
 
     def test_steer_rejects_model_change(self) -> None:
         args = task_channel.argparse.Namespace(
-            thread="thread", model="gpt-5.6-sol", effort=None
+            thread="thread", model="gpt-5.6-sol", effort=None, service_tier=None
         )
 
         async def exercise() -> None:
@@ -106,6 +106,76 @@ class MessageContractTests(unittest.TestCase):
             self.assertEqual(
                 task_channel.default_socket_path(),
                 Path("/tmp/codex-home/app-server-control/app-server-control.sock"),
+            )
+
+    def test_resume_omits_empty_config(self) -> None:
+        args = task_channel.argparse.Namespace(
+            thread="thread",
+            model=None,
+            effort=None,
+            service_tier=None,
+            cwd=None,
+            context_window=None,
+            auto_compact_token_limit=None,
+        )
+        self.assertEqual(
+            task_channel.resume_params(args),
+            {"threadId": "thread", "excludeTurns": True},
+        )
+
+    def test_resume_maps_explicit_session_config(self) -> None:
+        args = task_channel.argparse.Namespace(
+            thread="thread",
+            model="gpt-5.6-luna",
+            effort="high",
+            service_tier="default",
+            cwd=None,
+            context_window=320000,
+            auto_compact_token_limit=270000,
+        )
+        params = task_channel.resume_params(args)
+        self.assertEqual(params["model"], "gpt-5.6-luna")
+        self.assertEqual(params["serviceTier"], "default")
+        self.assertEqual(
+            params["config"],
+            {
+                "model_reasoning_effort": "high",
+                "model_context_window": 320000,
+                "model_auto_compact_token_limit": 270000,
+            },
+        )
+
+    def test_expected_effective_context_window_uses_model_limits(self) -> None:
+        with mock.patch.object(
+            task_channel,
+            "model_cache_entry",
+            return_value={
+                "max_context_window": 872000,
+                "effective_context_window_percent": 95,
+            },
+        ):
+            self.assertEqual(
+                task_channel.expected_effective_context_window(
+                    "gpt-5.6-luna", 320000
+                ),
+                304000,
+            )
+
+    def test_probe_effort_must_differ_from_active_effort(self) -> None:
+        with mock.patch.object(
+            task_channel,
+            "model_cache_entry",
+            return_value={
+                "supported_reasoning_levels": [
+                    {"effort": "low"},
+                    {"effort": "medium"},
+                    {"effort": "high"},
+                ]
+            },
+        ):
+            self.assertEqual(
+                task_channel.choose_probe_effort("gpt-5.6-luna", "low"),
+                "medium",
             )
 
 
@@ -129,7 +199,7 @@ class FakeThreadClient:
 class DeliveryModeTests(unittest.IsolatedAsyncioTestCase):
     def args(self) -> object:
         return task_channel.argparse.Namespace(
-            thread="thread", model=None, effort=None, cwd=None
+            thread="thread", model=None, effort=None, service_tier=None, cwd=None
         )
 
     async def test_followup_steers_active_turn(self) -> None:

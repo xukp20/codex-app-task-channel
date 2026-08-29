@@ -18,9 +18,11 @@
 <p align="center">
   <a href="#why-this-exists">Why</a>
   &middot;
+  <a href="#capabilities">Capabilities</a>
+  &middot;
   <a href="#delivery-modes">Delivery modes</a>
   &middot;
-  <a href="#quick-start">Quick Start</a>
+  <a href="#install">Install</a>
   &middot;
   <a href="skills/codex-app-task-channel/SKILL.md">Skill Reference</a>
 </p>
@@ -42,17 +44,32 @@ Some Codex builds can advertise task tools such as `create_thread` or
 The CLI still exposes `codex agents` and `codex queue`, and the desktop app's
 own App Server supports the underlying thread and turn protocol.
 
-This skill packages a narrow fallback around that protocol:
-
-- create or fork a named App-visible task;
-- start an idle turn;
-- steer an active turn immediately;
-- choose active-steer versus idle-start with `followup`;
-- enqueue a durable next message through `codex queue`;
-- read compact task state and verify the endpoint before mutation.
+This skill packages a narrow fallback around that protocol. It preserves task
+visibility and history in the App while exposing explicit lifecycle,
+configuration, and delivery controls.
 
 The protocol and its thread/turn methods are documented in the
-[official Codex App Server guide](https://learn.chatgpt.com/docs/app-server).
+[official Codex App Server guide](https://developers.openai.com/codex/app-server).
+
+## Capabilities
+
+| Capability | What it provides |
+| --- | --- |
+| App-visible task creation | Create and name a new sidebar task, then start its first turn |
+| History-aware forks | Branch completed task history into a separately named App task |
+| State-aware messaging | Automatically steer an active turn or start an idle turn |
+| Immediate intervention | Append user input to the currently running turn with steer |
+| Durable deferred delivery | Queue a message that starts only after the task becomes idle |
+| Existing-task resume | Reopen a not-loaded task or start the next configured turn on an idle task |
+| Per-task configuration | Select model, reasoning effort, service tier, working directory, context window, and auto-compaction threshold where the protocol supports them |
+| Safe loaded-Session replacement | Explicit, fail-closed cold replacement for Session-only settings such as context window |
+| Configuration receipts | Report requested and observed effective context windows and stable message/turn identifiers |
+| Read-only inspection | Check endpoint health and compact task status without sending a message |
+| Dispatch provenance | Wrap inter-task messages with a model-visible source task id |
+
+The skill does not replace nested subagents, change global Codex configuration,
+or maintain a hidden per-task configuration registry. Session-only overrides
+must be supplied again when a later cold resume still needs them.
 
 ## Delivery Modes
 
@@ -67,9 +84,11 @@ The protocol and its thread/turn methods are documented in the
 `steer` cannot change the model or reasoning effort of an already-running
 turn; wait for idle and use `start` when a configuration change is required.
 
-## Quick Start
+`resume` is not queue and is not same-turn intervention. It requires an idle or
+not-loaded task, resolves Session configuration, and starts a new turn. Use
+steer for immediate control of active work and queue for durable later work.
 
-### Install
+## Install
 
 ```bash
 git clone https://github.com/xukp20/codex-app-task-channel.git
@@ -83,7 +102,7 @@ ln -s "$PWD/skills/codex-app-task-channel" \
 Reload Codex after installation so the skill is discovered. A linked install
 can be updated with `git pull --ff-only`.
 
-### Verify the App-owned endpoint
+## Verify the App-owned endpoint
 
 ```bash
 python skills/codex-app-task-channel/scripts/task_channel.py doctor
@@ -98,61 +117,8 @@ ${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock
 Override it with `CODEX_APP_SERVER_SOCKET` or `--socket`. The helper currently
 supports the Unix socket used by the local desktop app.
 
-### Create an App-visible task
-
-```bash
-python skills/codex-app-task-channel/scripts/task_channel.py create \
-  --title "Coverage Monitor" \
-  --cwd /path/to/project \
-  --model gpt-5.6-sol \
-  --effort high \
-  --message "Read the task package and reply READY_CONFIG only."
-```
-
-The JSON receipt includes the `threadId`, `turnId`, delivery mode, and a
-`clientUserMessageId`. When an Agent creates a task on behalf of a user, it
-should verify the receipt and emit the normal Codex app directive:
-
-```text
-::created-thread{threadId="<thread-id>"}
-```
-
-### Fork a task
-
-```bash
-python skills/codex-app-task-channel/scripts/task_channel.py fork \
-  --from-thread 01abc... \
-  --title "Coverage Monitor / Reviewer" \
-  --model gpt-5.6-sol \
-  --effort high \
-  --message "Configuration preflight only. Reply READY_CONFIG."
-```
-
-### Send or steer
-
-```bash
-# Active turn: same-turn steer. Idle task: new turn.
-python skills/codex-app-task-channel/scripts/task_channel.py send \
-  --thread 01abc... \
-  --mode followup \
-  --message-file /tmp/task-message.txt
-
-# Explicit same-turn intervention.
-python skills/codex-app-task-channel/scripts/task_channel.py send \
-  --thread 01abc... \
-  --mode steer \
-  --message "Pause after the current tool call and report the blocker."
-
-# Durable next-turn delivery.
-python skills/codex-app-task-channel/scripts/task_channel.py send \
-  --thread 01abc... \
-  --mode queue \
-  --message "When idle, continue from GOAL.md."
-```
-
-Use `--source-thread <id>` to preserve the dispatcher's identity in a small
-`codex_delegation` envelope. This is model-visible provenance, not a claim that
-the fallback recreates every private telemetry field of a built-in tool.
+For operation selection, command examples, resume behavior, and cold-replace
+requirements, read the [Skill reference](skills/codex-app-task-channel/SKILL.md).
 
 ## Safety Boundaries
 
