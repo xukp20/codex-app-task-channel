@@ -91,7 +91,7 @@ The protocol and its thread/turn methods are documented in the
 | Per-task configuration | Select model, reasoning effort, service tier, working directory, context window, and auto-compaction threshold where the protocol supports them |
 | Safe loaded-Session replacement | Explicit, fail-closed cold replacement for Session-only settings such as context window |
 | Configuration receipts | Report requested and observed effective context windows and stable message/turn identifiers |
-| Read-only inspection | Check endpoint health and compact task status without sending a message |
+| Read-only inspection | Check endpoint health, task status, and recent user/agent messages without sending a message |
 | Dispatch provenance | Wrap inter-task messages with a model-visible source task id |
 
 The skill does not replace nested subagents, change global Codex configuration,
@@ -114,6 +114,23 @@ turn; wait for idle and use `start` when a configuration change is required.
 `resume` is not queue and is not same-turn intervention. It requires an idle or
 not-loaded task, resolves Session configuration, and starts a new turn. Use
 steer for immediate control of active work and queue for durable later work.
+
+Add `--wait` to `send`, `create`, `fork`, or `resume` when the caller needs a
+completed-turn receipt containing conversation messages and
+`lastAgentMessage`, rather than only an accepted turn id.
+
+## Read Task Content
+
+```bash
+python skills/codex-app-task-channel/scripts/task_channel.py read \
+  --thread THREAD_ID --turn-limit 3
+```
+
+The default response includes the latest turn's user and agent messages while
+omitting bulky tool items. Add `--include-items` for the complete raw items.
+The helper uses App Server's native `thread/turns/list` endpoint with
+`itemsView: "full"`, so it can verify content even when a higher-level task
+summary returns an empty turn shell.
 
 ## Install
 
@@ -192,7 +209,8 @@ python skills/codex-app-task-channel/scripts/task_channel.py doctor
 ```
 
 The unit suite exercises JSON-RPC response routing, active-turn selection,
-delegation envelopes, and delivery-mode behavior without mutating App state.
+content readback, completed-turn receipts, delegation envelopes, and
+delivery-mode behavior without mutating App state.
 The `doctor` command performs an initialized, read-only App Server handshake.
 
 ## Compatibility

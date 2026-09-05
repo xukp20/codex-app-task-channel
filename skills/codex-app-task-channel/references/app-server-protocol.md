@@ -28,7 +28,7 @@ for raw `recv()` calls; doing so can consume another request's response or lose
 | `fork` | `thread/fork`, `thread/name/set`, `turn/start` | Source turn must be forkable |
 | `resume` | `thread/read`, `thread/resume`, `turn/start` | Target must be idle or not loaded |
 | `resume --cold-replace` | two `thread/resume` calls, `thread/unsubscribe`, `turn/start` | Loaded target must be idle; caller explicitly opts in |
-| `read` | `thread/read(includeTurns=true)` | Read-only |
+| `read` | `thread/read`, `thread/turns/list(itemsView=full)` | Read-only |
 | `send --mode start` | `turn/start` | No active turn |
 | `send --mode steer` | `turn/steer(expectedTurnId=...)` | Matching active turn |
 | `send --mode followup` | Read, then steer or start | Race-aware |
@@ -36,6 +36,21 @@ for raw `recv()` calls; doing so can consume another request's response or lose
 
 Every direct input uses a UUID `clientUserMessageId`. The same ID is retained
 when `followup` rereads state and performs its one opposite-operation retry.
+
+## Content readback
+
+`thread/read(includeTurns=true)` remains useful for state inspection, but it
+can return the entire history and higher-level task wrappers may expose only
+turn shells. For user-visible content, the helper calls
+`thread/turns/list` newest-first with `itemsView: "full"`, then emits compact
+user/agent messages. `read --include-items` preserves the complete raw items
+when command or tool evidence is required.
+
+After `send`, `create`, `fork`, or `resume` with `--wait`, the helper reads the
+completed target turn through the same native endpoint and returns
+`messages` plus `lastAgentMessage`. Treat the accepted `turn/start` or
+`turn/steer` response as a dispatch receipt; use this completed readback as
+delivery evidence.
 
 ## Delivery semantics
 

@@ -58,6 +58,7 @@ class AppServerClient:
             path=str(self.socket_path),
             uri="ws://localhost/rpc",
             compression=None,
+            max_size=None,
             open_timeout=self.timeout,
         )
         self._reader_task = asyncio.create_task(self._reader())
@@ -135,6 +136,23 @@ class AppServerClient:
             "thread/read", {"threadId": thread_id, "includeTurns": True}
         )
         return result["thread"]
+
+    async def list_turns(
+        self,
+        thread_id: str,
+        *,
+        limit: int,
+        items_view: str,
+    ) -> dict[str, Any]:
+        return await self.request(
+            "thread/turns/list",
+            {
+                "threadId": thread_id,
+                "limit": limit,
+                "sortDirection": "desc",
+                "itemsView": items_view,
+            },
+        )
 
 
 def default_socket_path() -> Path:
@@ -267,10 +285,16 @@ async def wait_for_terminal(
 ) -> dict[str, Any]:
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
-        thread = await client.read_thread(thread_id)
-        for turn in thread.get("turns", []):
+        page = await client.list_turns(thread_id, limit=5, items_view="full")
+        for turn in page.get("data", []):
             if turn.get("id") == turn_id and turn.get("status") != "inProgress":
-                return {"status": turn.get("status"), "error": turn.get("error")}
+                messages = conversation_messages(turn)
+                return {
+                    "status": turn.get("status"),
+                    "error": turn.get("error"),
+                    "messages": messages,
+                    "lastAgentMessage": last_agent_message(messages),
+                }
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise ChannelError(f"timed out waiting for turn {turn_id}")
@@ -278,6 +302,35 @@ async def wait_for_terminal(
             await asyncio.wait_for(client.notifications.get(), timeout=min(1.0, remaining))
         except TimeoutError:
             pass
+
+
+def conversation_messages(turn: dict[str, Any]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for item in turn.get("items", []):
+        item_type = item.get("type")
+        if item_type == "userMessage":
+            text = "".join(
+                part.get("text", "")
+                for part in item.get("content", [])
+                if part.get("type") == "text"
+            )
+            messages.append({"role": "user", "text": text})
+        elif item_type == "agentMessage":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "text": item.get("text", ""),
+                    "phase": item.get("phase"),
+                }
+            )
+    return messages
+
+
+def last_agent_message(messages: list[dict[str, Any]]) -> str | None:
+    for message in reversed(messages):
+        if message.get("role") == "assistant":
+            return str(message.get("text", ""))
+    return None
 
 
 def load_message(args: argparse.Namespace) -> str:
@@ -709,14 +762,29 @@ async def command_send(args: argparse.Namespace) -> dict[str, Any]:
 async def command_read(args: argparse.Namespace) -> dict[str, Any]:
     async with AppServerClient(args.socket, timeout=args.rpc_timeout) as client:
         thread = await client.read_thread(args.thread)
-    turns = thread.get("turns", [])
+        page = await client.list_turns(
+            args.thread,
+            limit=args.turn_limit,
+            items_view="full",
+        )
+    turns = []
+    for turn in page.get("data", []):
+        entry = {
+            "id": turn.get("id"),
+            "status": turn.get("status"),
+            "error": turn.get("error"),
+            "messages": conversation_messages(turn),
+        }
+        if args.include_items:
+            entry["items"] = turn.get("items", [])
+        turns.append(entry)
     return {
         "threadId": thread.get("id"),
         "name": thread.get("name"),
         "status": thread_status(thread),
         "activeTurnId": active_turn_id(thread),
-        "lastTurnId": turns[-1].get("id") if turns else None,
-        "lastTurnStatus": turns[-1].get("status") if turns else None,
+        "turns": turns,
+        "nextCursor": page.get("nextCursor"),
         "cwd": thread.get("cwd"),
         "source": thread.get("source"),
     }
@@ -814,9 +882,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    read = subparsers.add_parser("read", help="read compact task state")
+    read = subparsers.add_parser("read", help="read task state and recent messages")
     add_connection_args(read)
     read.add_argument("--thread", required=True)
+    read.add_argument("--turn-limit", type=positive_int, default=1)
+    read.add_argument(
+        "--include-items",
+        action="store_true",
+        help="include complete raw turn items instead of only conversation messages",
+    )
     return parser
 
 

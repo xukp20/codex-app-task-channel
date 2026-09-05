@@ -36,6 +36,9 @@ class FakeWebSocket:
                 )
             )
 
+    async def close(self) -> None:
+        await self.incoming.put(None)
+
     def __aiter__(self) -> FakeWebSocket:
         return self
 
@@ -47,6 +50,24 @@ class FakeWebSocket:
 
 
 class RpcRouterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_accepts_large_app_server_messages(self) -> None:
+        websocket = FakeWebSocket()
+        connect = mock.AsyncMock(return_value=websocket)
+        with (
+            mock.patch.object(task_channel, "unix_connect", connect),
+            mock.patch.object(Path, "is_socket", return_value=True),
+        ):
+            async with task_channel.AppServerClient(Path("/app.sock")):
+                pass
+
+        connect.assert_awaited_once_with(
+            path="/app.sock",
+            uri="ws://localhost/rpc",
+            compression=None,
+            max_size=None,
+            open_timeout=15.0,
+        )
+
     async def test_one_reader_routes_concurrent_responses_and_notifications(self) -> None:
         client = task_channel.AppServerClient(Path("/unused"))
         websocket = FakeWebSocket()
@@ -69,6 +90,23 @@ class RpcRouterTests(unittest.IsolatedAsyncioTestCase):
         client._reader_task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await client._reader_task
+
+    async def test_list_turns_requests_full_newest_first_page(self) -> None:
+        client = task_channel.AppServerClient(Path("/unused"))
+        client.request = mock.AsyncMock(return_value={"data": []})
+
+        result = await client.list_turns("thread", limit=3, items_view="full")
+
+        self.assertEqual(result, {"data": []})
+        client.request.assert_awaited_once_with(
+            "thread/turns/list",
+            {
+                "threadId": "thread",
+                "limit": 3,
+                "sortDirection": "desc",
+                "itemsView": "full",
+            },
+        )
 
 
 class MessageContractTests(unittest.TestCase):
@@ -178,6 +216,39 @@ class MessageContractTests(unittest.TestCase):
                 "medium",
             )
 
+    def test_conversation_messages_keeps_user_and_agent_text_only(self) -> None:
+        turn = {
+            "items": [
+                {
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+                {"type": "commandExecution", "aggregatedOutput": "large output"},
+                {
+                    "type": "agentMessage",
+                    "text": "working",
+                    "phase": "commentary",
+                },
+                {
+                    "type": "agentMessage",
+                    "text": "done",
+                    "phase": "final_answer",
+                },
+            ]
+        }
+
+        messages = task_channel.conversation_messages(turn)
+
+        self.assertEqual(
+            messages,
+            [
+                {"role": "user", "text": "hello"},
+                {"role": "assistant", "text": "working", "phase": "commentary"},
+                {"role": "assistant", "text": "done", "phase": "final_answer"},
+            ],
+        )
+        self.assertEqual(task_channel.last_agent_message(messages), "done")
+
 
 class FakeThreadClient:
     def __init__(self, thread: dict[str, object]) -> None:
@@ -221,6 +292,82 @@ class DeliveryModeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(receipt, {"delivery": "start", "turnId": "new-turn"})
         self.assertEqual(client.requests[0][0], "turn/start")
+
+
+class ReadAndWaitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_receipt_includes_final_agent_message(self) -> None:
+        client = mock.Mock()
+        client.list_turns = mock.AsyncMock(
+            return_value={
+                "data": [
+                    {
+                        "id": "turn",
+                        "status": "completed",
+                        "error": None,
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": "ping"}],
+                            },
+                            {
+                                "type": "agentMessage",
+                                "text": "pong",
+                                "phase": "final_answer",
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+
+        receipt = await task_channel.wait_for_terminal(client, "thread", "turn", 1)
+
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["lastAgentMessage"], "pong")
+        self.assertEqual(receipt["messages"][-1]["text"], "pong")
+
+    async def test_command_read_returns_recent_messages_without_raw_items(self) -> None:
+        client = mock.AsyncMock()
+        client.__aenter__.return_value = client
+        client.read_thread.return_value = {
+            "id": "thread",
+            "name": "Example",
+            "status": {"type": "idle"},
+            "turns": [],
+            "cwd": "/repo",
+            "source": "vscode",
+        }
+        client.list_turns.return_value = {
+            "data": [
+                {
+                    "id": "turn",
+                    "status": "completed",
+                    "error": None,
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "text": "ready",
+                            "phase": "final_answer",
+                        }
+                    ],
+                }
+            ],
+            "nextCursor": "older",
+        }
+        args = task_channel.argparse.Namespace(
+            socket=Path("/app.sock"),
+            rpc_timeout=15.0,
+            thread="thread",
+            turn_limit=1,
+            include_items=False,
+        )
+
+        with mock.patch.object(task_channel, "AppServerClient", return_value=client):
+            result = await task_channel.command_read(args)
+
+        self.assertEqual(result["turns"][0]["messages"][0]["text"], "ready")
+        self.assertNotIn("items", result["turns"][0])
+        self.assertEqual(result["nextCursor"], "older")
 
 
 if __name__ == "__main__":

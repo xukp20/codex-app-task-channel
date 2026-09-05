@@ -39,7 +39,7 @@ selecting a delivery mode, diagnosing protocol drift, or scripting a fork.
 | Start work on a known-idle task | `send --mode start` | Start a new turn immediately |
 | Deliver only after the task becomes idle | `send --mode queue` | Store a durable later message through `codex queue` |
 | Reopen or reconfigure an existing task | `resume` | Require idle/not-loaded state, resolve Session configuration, then start a new turn |
-| Inspect without loading or messaging | `read` | Return compact task status and identifiers |
+| Inspect without loading or messaging | `read` | Return compact task status and recent user/agent messages |
 
 Do not treat `resume` as immediate messaging or as a durable queue. It works at
 an idle Session boundary and rejects active tasks. If new input must affect the
@@ -146,6 +146,32 @@ python scripts/task_channel.py send \
   --thread THREAD_ID --mode queue --message 'When idle, continue from GOAL.md.'
 ```
 
+Use `--wait` when the caller needs delivery evidence rather than only an
+accepted turn receipt. A completed wait result includes the target turn's
+conversation messages and `lastAgentMessage`:
+
+```bash
+python scripts/task_channel.py send \
+  --thread THREAD_ID --mode followup --wait --message 'Reply READY.'
+```
+
+## Read task content
+
+`read` returns the latest turn by default, including user and agent messages
+but excluding bulky tool and command items. Increase the page size with
+`--turn-limit`; add `--include-items` only when raw tool-level evidence is
+needed.
+
+```bash
+python scripts/task_channel.py read --thread THREAD_ID
+python scripts/task_channel.py read --thread THREAD_ID --turn-limit 3
+python scripts/task_channel.py read --thread THREAD_ID --include-items
+```
+
+The helper reads content through `thread/turns/list` with `itemsView: "full"`.
+Do not infer failed delivery from an empty higher-level task summary when this
+native readback contains the user and agent messages.
+
 `turn/steer` cannot change the active turn's model, reasoning effort, service
 tier, or context window. Model, effort, and service tier can be selected on a
 new `start`; context-window and auto-compaction changes require idle `resume`.
@@ -168,5 +194,7 @@ private built-in telemetry.
 - On ambiguous transport failure, use the receipt ID and task readback before
   retrying. Preserve one `clientUserMessageId` across the helper's race-aware
   `followup` retry.
+- When verifying a sent message, prefer `send --wait` or `read` and require the
+  expected agent text in `lastAgentMessage` or `turns[].messages`.
 - If protocol validation fails after a Codex upgrade, stop and prefer restored
   built-in tools until this fallback is updated.

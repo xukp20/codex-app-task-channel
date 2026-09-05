@@ -65,7 +65,7 @@ Codex App Task Channel 提供 `codex-app-task-channel` Skill，主要解决两�
 | 每任务配置 | 在协议支持范围内选择模型、推理强度、服务等级、工作目录、上下文窗口和自动压缩阈值 |
 | 安全替换已加载 Session | 对上下文窗口等 Session 级设置执行显式、fail-closed 的冷替换 |
 | 配置回执 | 报告请求值、观测到的有效上下文窗口以及稳定的消息/turn 标识符 |
-| 只读检查 | 在不发送消息的情况下检查端点健康状态和精简任务状态 |
+| 只读检查 | 在不发送消息的情况下检查端点健康状态、任务状态和近期用户/Agent 消息 |
 | 投递来源标识 | 为跨任务消息附加模型可见的来源任务 ID |
 
 该 Skill 不替代嵌套 subagent，不修改 Codex 全局配置，也不维护隐藏的每任务配置注册表。如果后续冷 resume 仍需要 Session 级覆盖项，必须再次显式提供。
@@ -82,6 +82,22 @@ Codex App Task Channel 提供 `codex-app-task-channel` Skill，主要解决两�
 `queue` 不是 steer，它不会改变当前 active turn。`steer` 无法修改已经运行中的 turn 所使用的模型或推理强度；需要更改配置时，应等待任务进入 idle，然后使用 `start`。
 
 `resume` 不是 queue，也不是同一 turn 内的干预。它要求任务处于 idle 或未加载状态，解析 Session 配置后启动新 turn。立即控制 active 工作应使用 steer；需要持久化的稍后投递应使用 queue。
+
+当调用方需要已完成 turn 的可验证回执，而不只是已接受的 turn id 时，可在
+`send`、`create`、`fork` 或 `resume` 后添加 `--wait`。回执会包含会话消息和
+`lastAgentMessage`。
+
+## 读取任务内容
+
+```bash
+python skills/codex-app-task-channel/scripts/task_channel.py read \
+  --thread THREAD_ID --turn-limit 3
+```
+
+默认输出包含最新 turn 的用户与 Agent 消息，并省略体积较大的工具 items。
+只有需要完整工具级证据时才添加 `--include-items`。辅助程序通过 App Server
+原生的 `thread/turns/list` 与 `itemsView: "full"` 读取内容，因此即使上层任务
+摘要只返回空 turn 外壳，也可以核验实际会话内容。
 
 ## 安装
 
@@ -148,7 +164,7 @@ python -m unittest discover -s tests -v
 python skills/codex-app-task-channel/scripts/task_channel.py doctor
 ```
 
-单元测试会覆盖 JSON-RPC 响应路由、active turn 选择、委派信封和消息投递模式行为，不会修改 App 状态。`doctor` 命令执行初始化后的只读 App Server 握手。
+单元测试会覆盖 JSON-RPC 响应路由、active turn 选择、内容读取、完成回执、委派信封和消息投递模式行为，不会修改 App 状态。`doctor` 命令执行初始化后的只读 App Server 握手。
 
 ## 兼容性
 
