@@ -26,6 +26,10 @@ class ChannelError(RuntimeError):
     """A task-channel operation failed without a safe automatic fallback."""
 
 
+class TaskStateUncertain(ChannelError):
+    """Read-only snapshots do not establish a safe delivery state."""
+
+
 class RpcError(ChannelError):
     """A JSON-RPC request was rejected by the app server."""
 
@@ -132,10 +136,45 @@ class AppServerClient:
         await self._ws.send(json.dumps(message, separators=(",", ":")))
 
     async def read_thread(self, thread_id: str) -> dict[str, Any]:
-        result = await self.request(
-            "thread/read", {"threadId": thread_id, "includeTurns": True}
+        before = await self.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}
         )
-        return result["thread"]
+        page = await self.list_turns(thread_id, limit=5, items_view="notLoaded")
+        after = await self.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}
+        )
+        thread = after["thread"]
+        initial = before["thread"]
+        if (
+            thread.get("id") != thread_id
+            or initial.get("id") != thread_id
+            or thread.get("cwd") != initial.get("cwd")
+        ):
+            raise ChannelError("task identity changed during delivery preflight")
+        if thread_status(thread) != thread_status(initial):
+            raise TaskStateUncertain("task state changed during delivery preflight")
+        turns = page.get("data")
+        if not isinstance(turns, list) or len(turns) > 5:
+            raise ChannelError("invalid bounded task state page")
+        for turn in turns:
+            if (
+                not isinstance(turn, dict)
+                or not isinstance(turn.get("id"), str)
+                or not turn["id"].strip()
+                or turn.get("status") not in {"inProgress", "completed", "interrupted", "failed"}
+            ):
+                raise ChannelError("invalid task turn identity or status; no message sent")
+        active = [turn for turn in turns if turn.get("status") == "inProgress"]
+        status = thread_status(thread)
+        if len(active) > 1:
+            raise ChannelError("multiple active task turns; no message sent")
+        if (status == "active") != bool(active):
+            raise TaskStateUncertain("task state is uncertain; reconcile before sending")
+        if status not in {"active", "idle", "notLoaded", "systemError"}:
+            raise ChannelError("unsupported task state; no message sent")
+        thread = dict(thread)
+        thread["turns"] = turns
+        return thread
 
     async def list_turns(
         self,
@@ -288,6 +327,18 @@ async def wait_for_terminal(
         page = await client.list_turns(thread_id, limit=5, items_view="full")
         for turn in page.get("data", []):
             if turn.get("id") == turn_id and turn.get("status") != "inProgress":
+                # Rollout-backed pages can briefly label an unfinished turn interrupted.
+                # Confirm against the loaded Session before treating it as terminal.
+                if turn.get("status") == "interrupted":
+                    try:
+                        thread = await client.read_thread(thread_id)
+                    except TaskStateUncertain:
+                        break
+                    if active_turn_id(thread) == turn_id:
+                        break
+                    live = next((item for item in thread.get("turns", []) if item.get("id") == turn_id), None)
+                    if live and live.get("status") in {"completed", "failed"}:
+                        turn = dict(turn, status=live["status"], error=live.get("error"))
                 messages = conversation_messages(turn)
                 return {
                     "status": turn.get("status"),

@@ -34,14 +34,21 @@ for raw `recv()` calls; doing so can consume another request's response or lose
 | `send --mode followup` | Read, then steer or start | Race-aware |
 | `send --mode queue` | `codex queue --remote unix://...` | Durable; dispatches when idle |
 
+`doctor` establishes initialization and listing only; it does not prove delivery
+or full-history compatibility. Delivery preflight reads the exact task metadata
+with `includeTurns=false`, a bounded five-turn page with `itemsView=notLoaded`,
+then metadata again. Changed identity/state or inconsistent active-turn evidence
+blocks sending. This avoids the legacy full-history route that some endpoints
+reject with `list_turns is not supported yet`.
+
 Every direct input uses a UUID `clientUserMessageId`. The same ID is retained
 when `followup` rereads state and performs its one opposite-operation retry.
 
 ## Content readback
 
-`thread/read(includeTurns=true)` remains useful for state inspection, but it
-can return the entire history and higher-level task wrappers may expose only
-turn shells. For user-visible content, the helper calls
+State inspection uses metadata and bounded turn pages without history items.
+Full-history hydration is unnecessary and may be unsupported. For explicitly
+requested user-visible content, the helper calls
 `thread/turns/list` newest-first with `itemsView: "full"`, then emits compact
 user/agent messages. `read --include-items` preserves the complete raw items
 when command or tool evidence is required.
