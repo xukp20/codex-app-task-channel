@@ -1,24 +1,5 @@
 <h1 align="center">Codex App Task Channel</h1>
 
-Provider sessions: `create`, `fork`, and `resume` now accept `--provider ID`,
-`--agent-config REGISTERED_ROLE`, and `--config-file /absolute/session.toml`.
-These configure an independent sidebar session, not a native subagent. For example:
-
-```bash
-python skills/codex-app-task-channel/scripts/task_channel.py create \
-  --title 'Provider check' --cwd /path/to/project \
-  --agent-config vendor-sol --message 'Perform the bounded check.' --wait
-python skills/codex-app-task-channel/scripts/task_channel.py resume \
-  --thread THREAD_ID --message 'Continue.' --wait
-```
-
-Configured threads get private, secret-free reference bindings in
-`$CODEX_HOME/task-channel/threads/`. Helper resume reloads those sources; already-loaded
-sessions require explicit `--cold-replace`, which can be blocked by Desktop subscribers.
-Direct Desktop reopen does not reapply helper bindings. Model/provider are verified before
-dispatch; context is checked afterwards. Successful configuration is not proof of a model
-response. See the [skill](skills/codex-app-task-channel/SKILL.md) for precedence and limits.
-
 <p align="center">
   <strong>English</strong> |
   <a href="README.zh-CN.md">简体中文</a>
@@ -48,6 +29,8 @@ response. See the [skill](skills/codex-app-task-channel/SKILL.md) for precedence
   &middot;
   <a href="#install">Install</a>
   &middot;
+  <a href="#agents-outside-the-codex-app">External agents</a>
+  &middot;
   <a href="skills/codex-app-task-channel/SKILL.md">Skill Reference</a>
 </p>
 
@@ -76,6 +59,10 @@ per-task configuration. The repository does not start a separate app-server
 daemon: its helper connects to the Unix socket owned by the running Codex
 desktop app, so tasks remain visible in the App sidebar and share the App's
 task state.
+
+Agents that run outside the Codex app, such as Claude Code, can use the same
+helper through the optional `codex-app-task-channel-external` skill; see
+[Agents outside the Codex app](#agents-outside-the-codex-app).
 
 ## Why This Exists
 
@@ -108,6 +95,7 @@ The protocol and its thread/turn methods are documented in the
 | Durable deferred delivery | Queue a message that starts only after the task becomes idle |
 | Existing-task resume | Reopen a not-loaded task or start the next configured turn on an idle task |
 | Per-task configuration | Select model, reasoning effort, service tier, working directory, context window, and auto-compaction threshold where the protocol supports them |
+| Provider and role configuration | Run a task on a chosen model provider, or import settings from a registered role or a TOML file; helper `resume` reloads them later |
 | Safe loaded-Session replacement | Explicit, fail-closed cold replacement for Session-only settings such as context window |
 | Configuration receipts | Report requested and observed effective context windows and stable message/turn identifiers |
 | Read-only inspection | Check endpoint health, task status, and recent user/agent messages without sending a message |
@@ -116,8 +104,9 @@ The protocol and its thread/turn methods are documented in the
 | Dispatch provenance | Wrap inter-task messages with a model-visible source task id |
 
 The skill does not replace nested subagents or change global Codex configuration.
-Configured tasks have explicit local reference bindings, reloaded by helper resume.
-Direct Desktop reopen and ordinary send do not reapply those bindings.
+Configured tasks keep local, secret-free references to their configuration
+sources, which helper `resume` reloads. Reopening a task in Desktop or sending an
+ordinary message does not reapply them.
 
 ## Delivery Modes
 
@@ -174,7 +163,26 @@ ln -s "$PWD/skills/codex-app-task-channel" \
 ```
 
 Reload Codex after installation so the skill is discovered. A linked install
-can be updated with `git pull --ff-only`.
+can be updated with `git pull --ff-only`. The helper requires Python 3.11+.
+
+## Verify the App-owned endpoint
+
+```bash
+python skills/codex-app-task-channel/scripts/task_channel.py doctor
+```
+
+The default socket is:
+
+```text
+${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock
+```
+
+Override it with `CODEX_APP_SERVER_SOCKET` or `--socket`. The helper currently
+supports the Unix socket used by the local desktop app.
+
+For operation selection, command examples, resume behavior, provider and role
+configuration, and cold-replace requirements, read the
+[Skill reference](skills/codex-app-task-channel/SKILL.md).
 
 ## Agents outside the Codex app
 
@@ -196,24 +204,6 @@ ln -s ../tool-sources/codex-app-task-channel/skills/codex-app-task-channel-exter
 Keeping the clone inside the agent's home lets a backup of that home stay
 self-contained. Update with `git -C ~/.claude/tool-sources/codex-app-task-channel pull --ff-only`.
 
-## Verify the App-owned endpoint
-
-```bash
-python skills/codex-app-task-channel/scripts/task_channel.py doctor
-```
-
-The default socket is:
-
-```text
-${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock
-```
-
-Override it with `CODEX_APP_SERVER_SOCKET` or `--socket`. The helper currently
-supports the Unix socket used by the local desktop app.
-
-For operation selection, command examples, resume behavior, and cold-replace
-requirements, read the [Skill reference](skills/codex-app-task-channel/SKILL.md).
-
 ## Safety Boundaries
 
 - Try built-in task tools first. Enter fallback only after tool discovery fails
@@ -222,7 +212,7 @@ requirements, read the [Skill reference](skills/codex-app-task-channel/SKILL.md)
   retrying through this channel, so a delayed success does not create a duplicate.
 - The helper never auto-approves requests and does not broaden sandbox or
   approval settings. New tasks inherit normal Codex configuration unless the
-  caller explicitly selects model, effort, or working directory.
+  caller explicitly selects configuration.
 - Connect to the desktop app's existing socket. Starting a separate app-server
   can create tasks that the desktop app does not own or immediately display.
 - `followup` performs one race-aware retry with the same
@@ -260,14 +250,17 @@ The root README is repository documentation. Codex links
 ```bash
 python /path/to/skill-creator/scripts/quick_validate.py \
   skills/codex-app-task-channel
+python /path/to/skill-creator/scripts/quick_validate.py \
+  skills/codex-app-task-channel-external
 python -m unittest discover -s tests -v
 python skills/codex-app-task-channel/scripts/task_channel.py doctor
 ```
 
 The unit suite exercises JSON-RPC response routing, active-turn selection,
 content readback, completed-turn receipts, delegation envelopes,
-delivery-mode behavior, provider-wide listing, and name resolution without
-mutating App state.
+delivery-mode behavior, provider and role configuration, provider-wide
+listing, name resolution, and the external sender wrapper without mutating
+App state.
 The `doctor` command performs an initialized, read-only App Server handshake.
 
 ## Compatibility

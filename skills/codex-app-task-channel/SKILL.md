@@ -42,6 +42,12 @@ selecting a delivery mode, diagnosing protocol drift, or scripting a fork.
 | Inspect without loading or messaging | `read` | Return compact task status and recent user/agent messages |
 | Find a task by name, directory, or provider | `list` | List tasks across all model providers, newest first |
 
+Do not treat `resume` as immediate messaging or as a durable queue. It works at
+an idle Session boundary and rejects active tasks. If new input must affect the
+current run, use `steer`; if it must wait durably for the current run to finish,
+use `queue`; use `resume` when reopening or Session configuration is the reason
+for the next turn.
+
 ## Find a task
 
 App Server's `thread/list` returns only the current default provider's tasks
@@ -60,12 +66,6 @@ otherwise a case-insensitive substring must match exactly one task. An
 ambiguous or missing name fails before any message is sent and lists the
 candidates. The receipt reports the resolved task under `resolvedByName`. Use
 `--thread` when names are duplicated or a mutation must target a known id.
-
-Do not treat `resume` as immediate messaging or as a durable queue. It works at
-an idle Session boundary and rejects active tasks. If new input must affect the
-current run, use `steer`; if it must wait durably for the current run to finish,
-use `queue`; use `resume` when reopening or Session configuration is the reason
-for the next turn.
 
 ## Create or fork a task
 
@@ -138,10 +138,11 @@ real turn restores the requested effort, or the prior/default effort when none
 was requested. Context is verified after turn start through the matching
 `task_started` event; inspect `contextWindowVerified` and the observed value.
 
-Native persistence does not retain an arbitrary Session config map. This helper
-now explicitly saves configuration references for configured tasks; see below.
-Ordinary Desktop messages and `send` remain native: they do not reapply bindings
-or rewrite global config. Use helper `resume` to reload bound configuration.
+Native persistence does not retain an arbitrary Session config map. For
+configured tasks the helper saves references to their configuration sources;
+see the next section. Ordinary Desktop messages and `send` remain native: they
+do not reapply those references or rewrite global config. Use helper `resume`
+to reload bound configuration.
 
 ## Provider and persistent session configuration
 
@@ -149,8 +150,7 @@ or rewrite global config. Use helper `resume` to reload bound configuration.
 and `--config-file /absolute/session.toml`. Read the protocol reference for the
 supported field subset and verification limits. Importing a role config here
 configures the independent sidebar Session itself; it is not native subagent
-role application. Current bounded native role loading may ignore provider,
-credentials and context overrides.
+role application, which may ignore provider, credential, and context settings.
 
 ```bash
 python scripts/task_channel.py create \
@@ -215,6 +215,14 @@ python scripts/task_channel.py send \
   --thread THREAD_ID --mode followup --wait --message 'Reply READY.'
 ```
 
+`turn/steer` cannot change the active turn's model, reasoning effort, service
+tier, or context window. Model, effort, and service tier can be selected on a
+new `start`; context-window and auto-compaction changes require idle `resume`.
+
+Use `--source-thread` for inter-task dispatches that need model-visible source
+provenance. This produces a `codex_delegation` envelope; it does not recreate
+private built-in telemetry.
+
 ## Read task content
 
 `read` returns the latest turn by default, including user and agent messages
@@ -235,14 +243,6 @@ with full message text; JSON stays the default for scripts and receipts.
 The helper reads content through `thread/turns/list` with `itemsView: "full"`.
 Do not infer failed delivery from an empty higher-level task summary when this
 native readback contains the user and agent messages.
-
-`turn/steer` cannot change the active turn's model, reasoning effort, service
-tier, or context window. Model, effort, and service tier can be selected on a
-new `start`; context-window and auto-compaction changes require idle `resume`.
-
-Use `--source-thread` for inter-task dispatches that need model-visible source
-provenance. This produces a `codex_delegation` envelope; it does not recreate
-private built-in telemetry.
 
 ## Boundaries
 
