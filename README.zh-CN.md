@@ -127,6 +127,19 @@ ln -s "$PWD/skills/codex-app-task-channel" \
 
 安装后重新加载 Codex，使其发现该 Skill。使用符号链接安装时，可以通过 `git pull --ff-only` 更新。
 
+## Codex App 之外的 agent
+
+在 Codex App 之外运行的 agent（例如 Claude Code）安装同一仓库里的可选 skill `codex-app-task-channel-external`，而不是主 skill。它的 `scripts/external_channel.py` 复用主脚本，命令完全相同；所有会发送消息的命令都必须带 `--sender NAME`，消息开头会加一行写明发送方，避免接收方误以为来自用户或另一个 Codex 任务。读取和列出不需要发送方。
+
+```bash
+git clone https://github.com/xukp20/codex-app-task-channel.git \
+  ~/.claude/tool-sources/codex-app-task-channel
+ln -s ../tool-sources/codex-app-task-channel/skills/codex-app-task-channel-external \
+  ~/.claude/skills/codex-app-task-channel-external
+```
+
+仓库副本放在 agent 自己的 home 里，这样备份该 home 时可以独立恢复。更新用 `git -C ~/.claude/tool-sources/codex-app-task-channel pull --ff-only`。
+
 ## 验证 App 所拥有的端点
 
 ```bash
@@ -161,16 +174,19 @@ codex-app-task-channel/
 ├── requirements.txt
 ├── tests/
 └── skills/
-    └── codex-app-task-channel/
+    ├── codex-app-task-channel/
+    │   ├── SKILL.md
+    │   ├── agents/openai.yaml
+    │   ├── references/app-server-protocol.md
+    │   └── scripts/
+    │       ├── task_channel.py
+    │       └── session_profiles.py
+    └── codex-app-task-channel-external/
         ├── SKILL.md
-        ├── agents/openai.yaml
-        ├── references/app-server-protocol.md
-        └── scripts/
-            ├── task_channel.py
-            └── session_profiles.py
+        └── scripts/external_channel.py
 ```
 
-仓库根目录 README 用于项目说明。只有 `skills/` 下的目录会链接到 Codex skills 目录。
+仓库根目录 README 用于项目说明。Codex 链接 `skills/codex-app-task-channel`；Codex App 之外的 agent 链接 `skills/codex-app-task-channel-external`。
 
 ## 验证
 

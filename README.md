@@ -176,6 +176,26 @@ ln -s "$PWD/skills/codex-app-task-channel" \
 Reload Codex after installation so the skill is discovered. A linked install
 can be updated with `git pull --ff-only`.
 
+## Agents outside the Codex app
+
+Agents that run outside the Codex app, such as Claude Code, install the optional
+`codex-app-task-channel-external` skill from the same repository instead of the
+main one. Its `scripts/external_channel.py` reuses the main helper with the same
+commands, and requires `--sender NAME` on every command that sends a message;
+the message is then prefixed with a line naming the sender, so the receiving
+task does not mistake it for the user or for another Codex task. Reading and
+listing need no sender.
+
+```bash
+git clone https://github.com/xukp20/codex-app-task-channel.git \
+  ~/.claude/tool-sources/codex-app-task-channel
+ln -s ../tool-sources/codex-app-task-channel/skills/codex-app-task-channel-external \
+  ~/.claude/skills/codex-app-task-channel-external
+```
+
+Keeping the clone inside the agent's home lets a backup of that home stay
+self-contained. Update with `git -C ~/.claude/tool-sources/codex-app-task-channel pull --ff-only`.
+
 ## Verify the App-owned endpoint
 
 ```bash
@@ -219,17 +239,21 @@ codex-app-task-channel/
 ├── requirements.txt
 ├── tests/
 └── skills/
-    └── codex-app-task-channel/
+    ├── codex-app-task-channel/
+    │   ├── SKILL.md
+    │   ├── agents/openai.yaml
+    │   ├── references/app-server-protocol.md
+    │   └── scripts/
+    │       ├── task_channel.py
+    │       └── session_profiles.py
+    └── codex-app-task-channel-external/
         ├── SKILL.md
-        ├── agents/openai.yaml
-        ├── references/app-server-protocol.md
-        └── scripts/
-            ├── task_channel.py
-            └── session_profiles.py
+        └── scripts/external_channel.py
 ```
 
-The root README is repository documentation. Only the directory under
-`skills/` is linked into the Codex skills directory.
+The root README is repository documentation. Codex links
+`skills/codex-app-task-channel`; agents outside the Codex app link
+`skills/codex-app-task-channel-external`.
 
 ## Validation
 
