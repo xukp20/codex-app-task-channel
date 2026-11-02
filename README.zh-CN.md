@@ -73,6 +73,8 @@ Codex App Task Channel 提供 `codex-app-task-channel` Skill，主要解决两�
 | 安全替换已加载 Session | 对上下文窗口等 Session 级设置执行显式、fail-closed 的冷替换 |
 | 配置回执 | 报告请求值、观测到的有效上下文窗口以及稳定的消息/turn 标识符 |
 | 只读检查 | 在不发送消息的情况下检查端点健康状态、任务状态和近期用户/Agent 消息 |
+| 任务查找 | 列出所有模型服务商的任务，并可按名称而不是 ID 指定任务 |
+| 可读的对话记录 | 按时间顺序把最近几轮以文本输出，方便人或其他 agent 阅读 |
 | 投递来源标识 | 为跨任务消息附加模型可见的来源任务 ID |
 
 该 Skill 不替代嵌套 subagent，也不修改 Codex 全局配置。带配置的任务有明确的本地引用绑定，工具 resume 会重新加载；直接通过 Desktop 重开或普通 send 不会自动重新应用绑定。
@@ -99,7 +101,13 @@ Codex App Task Channel 提供 `codex-app-task-channel` Skill，主要解决两�
 ```bash
 python skills/codex-app-task-channel/scripts/task_channel.py read \
   --thread THREAD_ID --turn-limit 3
+python skills/codex-app-task-channel/scripts/task_channel.py list \
+  --search 'Build Trace' --format text
+python skills/codex-app-task-channel/scripts/task_channel.py read \
+  --name 'Build Trace' --turn-limit 3 --format text
 ```
+
+App Server 默认只列出当前默认服务商的任务；`list` 和按名称查找会包含所有服务商。`read`、`send`、`resume` 支持 `--name`，`fork` 支持 `--from-name`。名称匹配到多个任务时直接报错并列出候选，不会发送任何消息。
 
 默认输出包含最新 turn 的用户与 Agent 消息，并省略体积较大的工具 items。
 只有需要完整工具级证据时才添加 `--include-items`。辅助程序通过 App Server
@@ -157,7 +165,9 @@ codex-app-task-channel/
         ├── SKILL.md
         ├── agents/openai.yaml
         ├── references/app-server-protocol.md
-        └── scripts/task_channel.py
+        └── scripts/
+            ├── task_channel.py
+            └── session_profiles.py
 ```
 
 仓库根目录 README 用于项目说明。只有 `skills/` 下的目录会链接到 Codex skills 目录。
@@ -171,7 +181,7 @@ python -m unittest discover -s tests -v
 python skills/codex-app-task-channel/scripts/task_channel.py doctor
 ```
 
-单元测试会覆盖 JSON-RPC 响应路由、active turn 选择、内容读取、完成回执、委派信封和消息投递模式行为，不会修改 App 状态。`doctor` 命令执行初始化后的只读 App Server 握手。
+单元测试会覆盖 JSON-RPC 响应路由、active turn 选择、内容读取、完成回执、委派信封、消息投递模式、跨服务商列表和名称解析，不会修改 App 状态。`doctor` 命令执行初始化后的只读 App Server 握手。
 
 ## 兼容性
 

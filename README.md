@@ -111,6 +111,8 @@ The protocol and its thread/turn methods are documented in the
 | Safe loaded-Session replacement | Explicit, fail-closed cold replacement for Session-only settings such as context window |
 | Configuration receipts | Report requested and observed effective context windows and stable message/turn identifiers |
 | Read-only inspection | Check endpoint health, task status, and recent user/agent messages without sending a message |
+| Task lookup | List tasks across all model providers and target a task by name instead of id |
+| Readable transcripts | Print recent turns oldest first as text for a person or another agent |
 | Dispatch provenance | Wrap inter-task messages with a model-visible source task id |
 
 The skill does not replace nested subagents or change global Codex configuration.
@@ -143,7 +145,16 @@ completed-turn receipt containing conversation messages and
 ```bash
 python skills/codex-app-task-channel/scripts/task_channel.py read \
   --thread THREAD_ID --turn-limit 3
+python skills/codex-app-task-channel/scripts/task_channel.py list \
+  --search 'Build Trace' --format text
+python skills/codex-app-task-channel/scripts/task_channel.py read \
+  --name 'Build Trace' --turn-limit 3 --format text
 ```
+
+App Server lists only the current default provider's tasks unless asked
+otherwise; `list` and name resolution include every provider. `read`, `send`,
+and `resume` accept `--name`, and `fork` accepts `--from-name`. An ambiguous
+name fails with the candidates before anything is sent.
 
 The default response includes the latest turn's user and agent messages while
 omitting bulky tool items. Add `--include-items` for the complete raw items.
@@ -212,7 +223,9 @@ codex-app-task-channel/
         ├── SKILL.md
         ├── agents/openai.yaml
         ├── references/app-server-protocol.md
-        └── scripts/task_channel.py
+        └── scripts/
+            ├── task_channel.py
+            └── session_profiles.py
 ```
 
 The root README is repository documentation. Only the directory under
@@ -228,8 +241,9 @@ python skills/codex-app-task-channel/scripts/task_channel.py doctor
 ```
 
 The unit suite exercises JSON-RPC response routing, active-turn selection,
-content readback, completed-turn receipts, delegation envelopes, and
-delivery-mode behavior without mutating App state.
+content readback, completed-turn receipts, delegation envelopes,
+delivery-mode behavior, provider-wide listing, and name resolution without
+mutating App state.
 The `doctor` command performs an initialized, read-only App Server handshake.
 
 ## Compatibility

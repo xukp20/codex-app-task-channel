@@ -33,6 +33,8 @@ for raw `recv()` calls; doing so can consume another request's response or lose
 | `send --mode steer` | `turn/steer(expectedTurnId=...)` | Matching active turn |
 | `send --mode followup` | Read, then steer or start | Race-aware |
 | `send --mode queue` | `codex queue --remote unix://...` | Durable; dispatches when idle |
+| `list` | `thread/list(modelProviders=[], searchTerm?, cursor)` | Read-only |
+| `--name` / `--from-name` | `thread/list` search plus a plain listing, resolved locally | Read-only; runs before any mutation |
 
 `doctor` establishes initialization and listing only; it does not prove delivery
 or full-history compatibility. Delivery preflight reads the exact task metadata
@@ -43,6 +45,20 @@ reject with `list_turns is not supported yet`.
 
 Every direct input uses a UUID `clientUserMessageId`. The same ID is retained
 when `followup` rereads state and performs its one opposite-operation retry.
+
+## Listing and name resolution
+
+Without `modelProviders`, `thread/list` returns only the current default
+provider's tasks; `modelProviders: []` asks for all providers. `searchTerm`
+matches task names but not working directories, so `list --cwd` filters
+locally. Pages may repeat a task and are not strictly ordered by update time;
+the helper merges rows by id, keeps the most recently updated row, and sorts
+newest first. `archived: true` lists archived tasks instead of active ones.
+
+Name resolution merges a search for the name with a plain listing, so a
+search-index gap cannot hide the target, then compares names locally: an exact
+name wins, otherwise a case-insensitive substring must match one task.
+Ambiguity or no match raises before any connection that could mutate state.
 
 ## Content readback
 

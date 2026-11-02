@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Callable, Self
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import session_profiles
@@ -236,6 +236,119 @@ def thread_status(thread: dict[str, Any]) -> str:
     if isinstance(status, dict):
         return str(status.get("type", "unknown"))
     return str(status)
+
+
+LIST_PAGE_LIMIT = 100
+LIST_MAX_PAGES = 50
+LIST_SCAN_LIMIT = 1000
+
+
+def epoch_iso(value: Any) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
+
+
+def thread_summary(thread: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "threadId": thread.get("id"),
+        "name": thread.get("name"),
+        "status": thread_status(thread),
+        "modelProvider": thread.get("modelProvider"),
+        "cwd": thread.get("cwd"),
+        "updatedAt": epoch_iso(thread.get("updatedAt")),
+        "source": thread.get("source"),
+    }
+
+
+async def list_threads(
+    client: AppServerClient,
+    *,
+    search: str | None = None,
+    providers: list[str] | None = None,
+    archived: bool = False,
+    max_threads: int = 50,
+) -> list[dict[str, Any]]:
+    """Return distinct tasks, newest first, across all model providers by default.
+
+    Without ``modelProviders``, App Server lists only the current default
+    provider's tasks, which hides tasks that run on another provider. An empty
+    list asks for every provider. Pages can repeat a task and are not ordered
+    by update time, so rows are merged by id, the most recently updated row is
+    kept, and the result is sorted locally after reading all pages (bounded by
+    LIST_SCAN_LIMIT distinct tasks).
+    """
+    params: dict[str, Any] = {
+        "limit": LIST_PAGE_LIMIT,
+        "modelProviders": list(providers or []),
+    }
+    if search:
+        params["searchTerm"] = search
+    if archived:
+        params["archived"] = True
+    seen: dict[str, dict[str, Any]] = {}
+    cursor: str | None = None
+    for _ in range(LIST_MAX_PAGES):
+        page_params = dict(params)
+        if cursor:
+            page_params["cursor"] = cursor
+        page = await client.request("thread/list", page_params)
+        for thread in page.get("data", []):
+            thread_id = thread.get("id")
+            if not isinstance(thread_id, str):
+                continue
+            previous = seen.get(thread_id)
+            if previous is None or (thread.get("updatedAt") or 0) > (
+                previous.get("updatedAt") or 0
+            ):
+                seen[thread_id] = thread
+        cursor = page.get("nextCursor")
+        if not cursor or len(seen) >= max(max_threads, LIST_SCAN_LIMIT):
+            break
+    threads = sorted(seen.values(), key=lambda item: item.get("updatedAt") or 0, reverse=True)
+    return threads[:max_threads]
+
+
+def ambiguous_name_error(query: str, matches: list[dict[str, Any]]) -> ChannelError:
+    shown = "; ".join(
+        f"{item.get('id')} {item.get('name')!r} ({item.get('modelProvider')}, {thread_status(item)})"
+        for item in matches[:10]
+    )
+    more = f"; and {len(matches) - 10} more" if len(matches) > 10 else ""
+    return ChannelError(
+        f"task name {query!r} matches {len(matches)} tasks; use the full name or --thread: "
+        f"{shown}{more}"
+    )
+
+
+async def resolve_thread_name(client: AppServerClient, name: str) -> dict[str, Any]:
+    """Resolve a task name to exactly one task, or fail without side effects.
+
+    An exact name wins; otherwise a case-insensitive substring must match one
+    task. Server search narrows candidates, and a plain listing is merged in so
+    that a search-index gap cannot hide the target.
+    """
+    query = name.strip()
+    if not query:
+        raise ChannelError("task name must not be empty")
+    candidates = {
+        item["id"]: item for item in await list_threads(client, search=query, max_threads=200)
+    }
+    for item in await list_threads(client, max_threads=500):
+        candidates.setdefault(item["id"], item)
+    named = [(item, str(item.get("name") or "").strip()) for item in candidates.values()]
+    exact = [item for item, label in named if label == query]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        raise ambiguous_name_error(query, exact)
+    folded = query.casefold()
+    partial = [item for item, label in named if folded in label.casefold()]
+    if len(partial) == 1:
+        return partial[0]
+    if not partial:
+        raise ChannelError(f"no task name contains {query!r}; run list to see task names")
+    raise ambiguous_name_error(query, partial)
 
 
 def common_turn_params(args: argparse.Namespace, message: str, message_id: str) -> dict[str, Any]:
@@ -861,6 +974,69 @@ async def command_read(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+async def command_list(args: argparse.Namespace) -> dict[str, Any]:
+    cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else None
+    async with AppServerClient(args.socket, timeout=args.rpc_timeout) as client:
+        threads = await list_threads(
+            client,
+            search=args.search,
+            providers=args.provider,
+            archived=args.archived,
+            max_threads=LIST_SCAN_LIMIT if cwd else args.limit,
+        )
+    if cwd:
+        threads = [item for item in threads if item.get("cwd") == cwd]
+    return {"threads": [thread_summary(item) for item in threads[: args.limit]]}
+
+
+async def resolve_targets(args: argparse.Namespace) -> None:
+    """Replace --name/--from-name with the matching thread id before any mutation."""
+    name = getattr(args, "name", None)
+    from_name = getattr(args, "from_name", None)
+    if name is None and from_name is None:
+        return
+    async with AppServerClient(args.socket, timeout=args.rpc_timeout) as client:
+        if name is not None:
+            target = await resolve_thread_name(client, name)
+            args.thread = target["id"]
+            args.resolved_by_name = {"query": name, **thread_summary(target)}
+        if from_name is not None:
+            source = await resolve_thread_name(client, from_name)
+            args.from_thread = source["id"]
+            args.resolved_source_by_name = {"query": from_name, **thread_summary(source)}
+
+
+def render_text(args: argparse.Namespace, result: dict[str, Any]) -> str:
+    if args.command == "list":
+        rows = result["threads"]
+        if not rows:
+            return "No matching tasks."
+        lines = []
+        for row in rows:
+            lines.append(
+                f"{row.get('updatedAt') or '-'}  {row['status']:<9}  {row.get('modelProvider') or '-':<12}  "
+                f"{row['threadId']}  {row.get('name') or '(unnamed)'}  [{row.get('cwd')}]"
+            )
+        return "\n".join(lines)
+    lines = [
+        f"# {result.get('name') or '(unnamed task)'}",
+        f"thread {result.get('threadId')} | status {result.get('status')} | cwd {result.get('cwd')}",
+    ]
+    turns = list(reversed(result.get("turns", [])))
+    if result.get("nextCursor"):
+        lines.append(f"(showing the latest {len(turns)} turns; raise --turn-limit for older ones)")
+    for index, turn in enumerate(turns, 1):
+        lines += ["", f"## Turn {index}/{len(turns)} | {turn.get('status')} | {turn.get('id')}"]
+        if turn.get("error"):
+            lines.append(f"error: {json.dumps(turn['error'], ensure_ascii=False)}")
+        for message in turn.get("messages", []):
+            label = "User" if message.get("role") == "user" else "Assistant"
+            if message.get("phase"):
+                label += f" ({message['phase']})"
+            lines += ["", f"### {label}", "", str(message.get("text", "")).rstrip()]
+    return "\n".join(lines)
+
+
 def add_connection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--socket", type=Path, default=default_socket_path())
     parser.add_argument("--rpc-timeout", type=float, default=15.0)
@@ -904,6 +1080,15 @@ def add_wait_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wait-timeout", type=float, default=300.0)
 
 
+def add_target_args(parser: argparse.ArgumentParser) -> None:
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--thread", help="task id")
+    target.add_argument(
+        "--name",
+        help="task name; an exact name wins, otherwise the substring must match one task",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -924,7 +1109,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_message_args(fork)
     add_session_config_args(fork)
     add_wait_args(fork)
-    fork.add_argument("--from-thread", required=True)
+    source = fork.add_mutually_exclusive_group(required=True)
+    source.add_argument("--from-thread", help="source task id")
+    source.add_argument("--from-name", help="source task name, resolved like --name")
     fork.add_argument("--last-turn")
     fork.add_argument("--title", required=True)
     fork.set_defaults(cwd=os.getcwd())
@@ -934,7 +1121,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_message_args(send)
     add_turn_config_args(send)
     add_wait_args(send)
-    send.add_argument("--thread", required=True)
+    add_target_args(send)
     send.add_argument(
         "--mode", choices=["followup", "steer", "start", "queue"], default="followup"
     )
@@ -946,7 +1133,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_message_args(resume)
     add_session_config_args(resume)
     add_wait_args(resume)
-    resume.add_argument("--thread", required=True)
+    add_target_args(resume)
     resume.add_argument(
         "--cold-replace",
         action="store_true",
@@ -958,39 +1145,77 @@ def build_parser() -> argparse.ArgumentParser:
 
     read = subparsers.add_parser("read", help="read task state and recent messages")
     add_connection_args(read)
-    read.add_argument("--thread", required=True)
+    add_target_args(read)
     read.add_argument("--turn-limit", type=positive_int, default=1)
     read.add_argument(
         "--include-items",
         action="store_true",
         help="include complete raw turn items instead of only conversation messages",
     )
+    read.add_argument(
+        "--format",
+        choices=["json", "text"],
+        default="json",
+        help="text prints the turns oldest first as a readable transcript",
+    )
+
+    listing = subparsers.add_parser(
+        "list", help="list tasks across all model providers, newest first"
+    )
+    add_connection_args(listing)
+    listing.add_argument("--search", help="App Server search term, such as part of a task name")
+    listing.add_argument("--cwd", help="keep only tasks whose working directory is exactly this path")
+    listing.add_argument(
+        "--provider",
+        action="append",
+        help="keep only this model provider id; repeat for several (default: all providers)",
+    )
+    listing.add_argument("--archived", action="store_true", help="list archived tasks instead")
+    listing.add_argument("--limit", type=positive_int, default=30)
+    listing.add_argument("--format", choices=["json", "text"], default="json")
     return parser
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     args.socket = args.socket.expanduser().resolve()
+    # Names resolve first: resume bindings are keyed by the resolved thread id.
+    await resolve_targets(args)
     if args.command in {"create", "fork", "resume"}:
         session_profiles.prepare(args)
     if args.command == "doctor":
         return await command_doctor(args)
+    if args.command == "list":
+        return await command_list(args)
     if args.command == "create":
-        return await create_or_fork(args, fork=False)
-    if args.command == "fork":
-        return await create_or_fork(args, fork=True)
-    if args.command == "resume":
-        return await command_resume(args)
-    if args.command == "send":
-        return await command_send(args)
-    if args.command == "read":
-        return await command_read(args)
-    raise AssertionError(args.command)
+        result = await create_or_fork(args, fork=False)
+    elif args.command == "fork":
+        result = await create_or_fork(args, fork=True)
+    elif args.command == "resume":
+        result = await command_resume(args)
+    elif args.command == "send":
+        result = await command_send(args)
+    elif args.command == "read":
+        result = await command_read(args)
+    else:
+        raise AssertionError(args.command)
+    if getattr(args, "resolved_by_name", None):
+        result["resolvedByName"] = args.resolved_by_name
+    if getattr(args, "resolved_source_by_name", None):
+        result["resolvedSourceByName"] = args.resolved_source_by_name
+    return result
 
 
-def main() -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    adjust: Callable[[argparse.Namespace], None] | None = None,
+) -> int:
+    """Run the CLI; ``adjust`` lets a wrapper amend parsed arguments before any RPC."""
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
+        if adjust is not None:
+            adjust(args)
         result = asyncio.run(run(args))
     except (ChannelError, OSError, ValueError) as exc:
         # Provider RPC errors may echo configuration; never emit secret values.
@@ -1008,6 +1233,11 @@ def main() -> int:
             error = 'Invalid session configuration (check TOML and supported fields)' if 'TOML' in type(exc).__name__ else error
         print(json.dumps({"ok": False, "error": error}, ensure_ascii=False), file=sys.stderr)
         return 1
+    if getattr(args, "format", "json") == "text":
+        if getattr(args, "include_items", False):
+            print("note: --include-items is omitted from text output; use --format json", file=sys.stderr)
+        print(render_text(args, result))
+        return 0
     print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, indent=2))
     return 0
 

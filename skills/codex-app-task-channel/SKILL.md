@@ -1,6 +1,6 @@
 ---
 name: codex-app-task-channel
-description: Create, resume, fork, inspect, or message Codex desktop tasks through the App-owned App Server when built-in task tools are unavailable or cannot express an explicitly requested per-task session configuration such as context window. Use only for App-visible task coordination; keep built-in task tools as the default for ordinary operations and do not use this for nested subagents.
+description: Create, resume, fork, find, inspect, or message Codex desktop tasks through the App-owned App Server when built-in task tools are unavailable or cannot express an explicitly requested per-task session configuration such as context window. Use only for App-visible task coordination; keep built-in task tools as the default for ordinary operations and do not use this for nested subagents.
 ---
 
 # Codex App Task Channel
@@ -40,6 +40,26 @@ selecting a delivery mode, diagnosing protocol drift, or scripting a fork.
 | Deliver only after the task becomes idle | `send --mode queue` | Store a durable later message through `codex queue` |
 | Reopen or reconfigure an existing task | `resume` | Require idle/not-loaded state, resolve Session configuration, then start a new turn |
 | Inspect without loading or messaging | `read` | Return compact task status and recent user/agent messages |
+| Find a task by name, directory, or provider | `list` | List tasks across all model providers, newest first |
+
+## Find a task
+
+App Server's `thread/list` returns only the current default provider's tasks
+unless told otherwise, so tasks running on another provider look missing.
+`list` asks for every provider, merges repeated rows, and sorts by update time:
+
+```bash
+python scripts/task_channel.py list --search 'Build Trace' --format text
+python scripts/task_channel.py list --cwd /path/to/project
+python scripts/task_channel.py list --provider krill-code --limit 10
+```
+
+`read`, `send`, and `resume` take `--name` instead of `--thread`, and `fork`
+takes `--from-name` instead of `--from-thread`. An exact task name wins;
+otherwise a case-insensitive substring must match exactly one task. An
+ambiguous or missing name fails before any message is sent and lists the
+candidates. The receipt reports the resolved task under `resolvedByName`. Use
+`--thread` when names are duplicated or a mutation must target a known id.
 
 Do not treat `resume` as immediate messaging or as a durable queue. It works at
 an idle Session boundary and rejects active tasks. If new input must affect the
@@ -206,7 +226,11 @@ needed.
 python scripts/task_channel.py read --thread THREAD_ID
 python scripts/task_channel.py read --thread THREAD_ID --turn-limit 3
 python scripts/task_channel.py read --thread THREAD_ID --include-items
+python scripts/task_channel.py read --name 'Build Trace' --turn-limit 3 --format text
 ```
+
+`--format text` prints the returned turns oldest first as a readable transcript
+with full message text; JSON stays the default for scripts and receipts.
 
 The helper reads content through `thread/turns/list` with `itemsView: "full"`.
 Do not infer failed delivery from an empty higher-level task summary when this
@@ -238,3 +262,5 @@ private built-in telemetry.
   expected agent text in `lastAgentMessage` or `turns[].messages`.
 - If protocol validation fails after a Codex upgrade, stop and prefer restored
   built-in tools until this fallback is updated.
+- Agents outside the Codex app, such as Claude Code, use the optional
+  `codex-app-task-channel-external` skill in this repository instead of this one.

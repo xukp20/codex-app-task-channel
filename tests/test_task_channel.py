@@ -446,5 +446,127 @@ class ReadAndWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["nextCursor"], "older")
 
 
+def listed(thread_id, name, updated, provider="openai", cwd="/repo"):
+    return {
+        "id": thread_id,
+        "name": name,
+        "updatedAt": updated,
+        "modelProvider": provider,
+        "cwd": cwd,
+        "status": {"type": "idle"},
+        "source": "vscode",
+    }
+
+
+class FakeListClient:
+    """Serves thread/list pages; a search term filters names like App Server does."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+
+    async def request(self, method, params):
+        assert method == "thread/list"
+        self.calls.append(params)
+        index = int(params.get("cursor") or 0)
+        rows = self.pages[index]
+        term = params.get("searchTerm")
+        if term:
+            rows = [row for row in rows if term in row["name"]]
+        cursor = str(index + 1) if index + 1 < len(self.pages) else None
+        return {"data": rows, "nextCursor": cursor}
+
+
+class ListAndNameTests(unittest.IsolatedAsyncioTestCase):
+    async def test_list_spans_providers_pages_and_duplicates(self) -> None:
+        client = FakeListClient([
+            [listed("a", "Alpha", 10), listed("b", "Beta · Krill", 30, "krill-code")],
+            [listed("a", "Alpha", 20), listed("c", "Gamma", 5)],
+        ])
+        threads = await task_channel.list_threads(client)
+        self.assertEqual(client.calls[0]["modelProviders"], [])
+        self.assertEqual(client.calls[1]["cursor"], "1")
+        self.assertEqual([item["id"] for item in threads], ["b", "a", "c"])
+        self.assertEqual(threads[1]["updatedAt"], 20)
+
+    async def test_small_limit_still_returns_newest_across_all_pages(self) -> None:
+        client = FakeListClient([
+            [listed("old1", "One", 1), listed("old2", "Two", 2)],
+            [listed("newest", "Three", 99)],
+        ])
+        threads = await task_channel.list_threads(client, max_threads=1)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual([item["id"] for item in threads], ["newest"])
+
+    async def test_exact_name_wins_over_substring_matches(self) -> None:
+        client = FakeListClient([[
+            listed("old", "Build trace", 10),
+            listed("new", "Build trace · Krill", 20, "krill-code"),
+        ]])
+        target = await task_channel.resolve_thread_name(client, "Build trace")
+        self.assertEqual(target["id"], "old")
+
+    async def test_unique_substring_resolves_case_insensitively(self) -> None:
+        client = FakeListClient([[listed("x", "Lean Imports · Krill", 10), listed("y", "Other", 9)]])
+        target = await task_channel.resolve_thread_name(client, "imports")
+        self.assertEqual(target["id"], "x")
+
+    async def test_ambiguous_or_missing_name_fails_with_candidates(self) -> None:
+        client = FakeListClient([[listed("p", "Trace one", 10), listed("q", "Trace two", 9)]])
+        with self.assertRaisesRegex(task_channel.ChannelError, "matches 2 tasks.*p 'Trace one'"):
+            await task_channel.resolve_thread_name(client, "Trace")
+        with self.assertRaisesRegex(task_channel.ChannelError, "no task name contains"):
+            await task_channel.resolve_thread_name(client, "missing")
+
+    async def test_name_resolves_before_profile_preparation(self) -> None:
+        client = mock.AsyncMock()
+        client.__aenter__.return_value = client
+        args = task_channel.build_parser().parse_args(
+            ["resume", "--name", "Alpha", "--message", "continue"]
+        )
+        order = []
+
+        async def resolve(_client, name):
+            order.append("resolve")
+            return listed("resolved-id", name, 1)
+
+        def prepare(parsed):
+            order.append(("prepare", parsed.thread))
+
+        with (
+            mock.patch.object(task_channel, "AppServerClient", return_value=client),
+            mock.patch.object(task_channel, "resolve_thread_name", side_effect=resolve),
+            mock.patch.object(task_channel.session_profiles, "prepare", side_effect=prepare),
+            mock.patch.object(task_channel, "command_resume", mock.AsyncMock(return_value={})),
+        ):
+            result = await task_channel.run(args)
+
+        self.assertEqual(order, ["resolve", ("prepare", "resolved-id")])
+        self.assertEqual(result["resolvedByName"]["threadId"], "resolved-id")
+
+    def test_target_is_required_and_exclusive(self) -> None:
+        parser = task_channel.build_parser()
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            parser.parse_args(["send", "--message", "x"])
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            parser.parse_args(["send", "--thread", "t", "--name", "n", "--message", "x"])
+
+    def test_text_transcript_is_oldest_first(self) -> None:
+        args = task_channel.build_parser().parse_args(["read", "--thread", "t", "--format", "text"])
+        result = {
+            "threadId": "t", "name": "Example", "status": "idle", "cwd": "/repo",
+            "nextCursor": None,
+            "turns": [
+                {"id": "new", "status": "completed", "error": None,
+                 "messages": [{"role": "assistant", "text": "second", "phase": "final_answer"}]},
+                {"id": "old", "status": "completed", "error": None,
+                 "messages": [{"role": "user", "text": "first"}]},
+            ],
+        }
+        text = task_channel.render_text(args, result)
+        self.assertLess(text.index("first"), text.index("second"))
+        self.assertIn("### Assistant (final_answer)", text)
+
+
 if __name__ == "__main__":
     unittest.main()
