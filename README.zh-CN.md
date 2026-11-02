@@ -1,5 +1,12 @@
 <h1 align="center">Codex App Task Channel</h1>
 
+新增独立会话配置：`create`、`fork`、`resume` 支持 `--provider ID`、
+`--agent-config 已注册角色` 和 `--config-file /绝对路径/session.toml`。
+这里导入的是侧栏会话自身的配置，不依赖原生 subagent 对 provider 的覆盖能力。
+配置引用保存在 `$CODEX_HOME/task-channel/threads/`，不复制密钥。
+工具 `resume` 会重新读取引用；已加载会话需要显式 `--cold-replace`，其他订阅者
+可能阻止替换。直接在 Desktop 重开不会自动应用这些绑定。当前需要 Python 3.11+。
+
 <p align="center">
   <a href="README.md">English</a> |
   <strong>简体中文</strong>
@@ -14,7 +21,7 @@
     <img alt="Codex Skill" src="https://img.shields.io/badge/Codex-Skill-2563eb?style=flat-square">
   </a>
   <a href="https://www.python.org/">
-    <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-172554?style=flat-square">
+    <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-172554?style=flat-square">
   </a>
   <img alt="传输方式" src="https://img.shields.io/badge/transport-App%20Server-0f8f88?style=flat-square">
   <img alt="项目状态" src="https://img.shields.io/badge/status-experimental-d97706?style=flat-square">
@@ -68,7 +75,7 @@ Codex App Task Channel 提供 `codex-app-task-channel` Skill，主要解决两�
 | 只读检查 | 在不发送消息的情况下检查端点健康状态、任务状态和近期用户/Agent 消息 |
 | 投递来源标识 | 为跨任务消息附加模型可见的来源任务 ID |
 
-该 Skill 不替代嵌套 subagent，不修改 Codex 全局配置，也不维护隐藏的每任务配置注册表。如果后续冷 resume 仍需要 Session 级覆盖项，必须再次显式提供。
+该 Skill 不替代嵌套 subagent，也不修改 Codex 全局配置。带配置的任务有明确的本地引用绑定，工具 resume 会重新加载；直接通过 Desktop 重开或普通 send 不会自动重新应用绑定。
 
 ## 消息投递模式
 

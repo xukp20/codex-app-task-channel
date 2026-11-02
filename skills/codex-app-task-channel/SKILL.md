@@ -118,10 +118,50 @@ real turn restores the requested effort, or the prior/default effort when none
 was requested. Context is verified after turn start through the matching
 `task_started` event; inspect `contextWindowVerified` and the observed value.
 
-Session overrides are not durable task metadata. A later cold resume that does
-not resend them can use the then-current global values. Ordinary Desktop
-messages and ordinary `send` calls remain native: this Skill does not intercept
-them, rewrite global config, or maintain a hidden per-task config registry.
+Native persistence does not retain an arbitrary Session config map. This helper
+now explicitly saves configuration references for configured tasks; see below.
+Ordinary Desktop messages and `send` remain native: they do not reapply bindings
+or rewrite global config. Use helper `resume` to reload bound configuration.
+
+## Provider and persistent session configuration
+
+`create`, `fork`, and `resume` accept `--provider ID`, `--agent-config ROLE_ID`,
+and `--config-file /absolute/session.toml`. Read the protocol reference for the
+supported field subset and verification limits. Importing a role config here
+configures the independent sidebar Session itself; it is not native subagent
+role application. Current bounded native role loading may ignore provider,
+credentials and context overrides.
+
+```bash
+python scripts/task_channel.py create \
+  --title 'Vendor Luna check' --cwd /path/to/project \
+  --agent-config vendor-luna --message 'Perform the bounded check.' --wait
+
+# The binding is read automatically; no key or role argument needs repeating.
+python scripts/task_channel.py resume --thread THREAD_ID \
+  --message 'Continue the check.' --wait
+```
+
+Precedence: registered role settings, then explicit TOML file, then CLI settings.
+Provider definitions are read locally and role-specific authentication overrides
+are merged. Never put keys in the message or CLI arguments. Model/provider are
+checked against the App Server response before sending work; a mismatch stops
+without sending the task. Context verification remains post-start evidence.
+A READY reply alone proves neither routing nor credential selection.
+
+Bindings live in `$CODEX_HOME/task-channel/threads/THREAD_ID.json` (files 0600,
+directory 0700). They contain role/file references, explicit non-secret settings
+and socket identity, not resolved credentials. Resume re-reads sources, so key
+rotation takes effect; missing references fail rather than falling back.
+The receipt exposes `configBinding`, `modelProvider`, and `providerVerified`.
+Binding is saved as soon as creation returns an ID, even if subsequent validation
+fails; inspect that task instead of blindly retrying creation.
+
+Bound resumes require a not-loaded Session or explicit `--cold-replace` when
+already loaded. Another Desktop subscriber may prevent replacement; the existing
+canary then rejects before sending work. Direct Desktop reopen does not invoke
+this helper and cannot guarantee reapplication of custom keys/context. A binding
+is local helper persistence, not a native permanent thread-config feature.
 
 ## Select message delivery deliberately
 

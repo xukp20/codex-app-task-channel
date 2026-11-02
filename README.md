@@ -1,5 +1,24 @@
 <h1 align="center">Codex App Task Channel</h1>
 
+Provider sessions: `create`, `fork`, and `resume` now accept `--provider ID`,
+`--agent-config REGISTERED_ROLE`, and `--config-file /absolute/session.toml`.
+These configure an independent sidebar session, not a native subagent. For example:
+
+```bash
+python skills/codex-app-task-channel/scripts/task_channel.py create \
+  --title 'Provider check' --cwd /path/to/project \
+  --agent-config vendor-sol --message 'Perform the bounded check.' --wait
+python skills/codex-app-task-channel/scripts/task_channel.py resume \
+  --thread THREAD_ID --message 'Continue.' --wait
+```
+
+Configured threads get private, secret-free reference bindings in
+`$CODEX_HOME/task-channel/threads/`. Helper resume reloads those sources; already-loaded
+sessions require explicit `--cold-replace`, which can be blocked by Desktop subscribers.
+Direct Desktop reopen does not reapply helper bindings. Model/provider are verified before
+dispatch; context is checked afterwards. Successful configuration is not proof of a model
+response. See the [skill](skills/codex-app-task-channel/SKILL.md) for precedence and limits.
+
 <p align="center">
   <strong>English</strong> |
   <a href="README.zh-CN.md">简体中文</a>
@@ -14,7 +33,7 @@
     <img alt="Codex Skill" src="https://img.shields.io/badge/Codex-Skill-2563eb?style=flat-square">
   </a>
   <a href="https://www.python.org/">
-    <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-172554?style=flat-square">
+    <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-172554?style=flat-square">
   </a>
   <img alt="Transport" src="https://img.shields.io/badge/transport-App%20Server-0f8f88?style=flat-square">
   <img alt="Status" src="https://img.shields.io/badge/status-experimental-d97706?style=flat-square">
@@ -94,9 +113,9 @@ The protocol and its thread/turn methods are documented in the
 | Read-only inspection | Check endpoint health, task status, and recent user/agent messages without sending a message |
 | Dispatch provenance | Wrap inter-task messages with a model-visible source task id |
 
-The skill does not replace nested subagents, change global Codex configuration,
-or maintain a hidden per-task configuration registry. Session-only overrides
-must be supplied again when a later cold resume still needs them.
+The skill does not replace nested subagents or change global Codex configuration.
+Configured tasks have explicit local reference bindings, reloaded by helper resume.
+Direct Desktop reopen and ordinary send do not reapply those bindings.
 
 ## Delivery Modes
 

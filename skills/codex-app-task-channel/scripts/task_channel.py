@@ -16,6 +16,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Self
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import session_profiles
+
 try:
     from websockets.legacy.client import unix_connect
 except ImportError:  # pragma: no cover - exercised by the runtime dependency check
@@ -442,6 +445,7 @@ async def command_doctor(args: argparse.Namespace) -> dict[str, Any]:
 def thread_creation_params(args: argparse.Namespace) -> dict[str, Any]:
     params: dict[str, Any] = {
         "model": args.model,
+        "modelProvider": getattr(args, "provider", None),
         "serviceTier": args.service_tier,
         "cwd": str(Path(args.cwd).expanduser().resolve()),
         "ephemeral": False,
@@ -453,7 +457,7 @@ def thread_creation_params(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def session_config_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    config: dict[str, Any] = {}
+    config: dict[str, Any] = dict(getattr(args, "session_overrides", {}))
     if getattr(args, "effort", None):
         config["model_reasoning_effort"] = args.effort
     if getattr(args, "context_window", None) is not None:
@@ -467,6 +471,8 @@ def has_session_only_overrides(args: argparse.Namespace) -> bool:
     return (
         getattr(args, "context_window", None) is not None
         or getattr(args, "auto_compact_token_limit", None) is not None
+        or bool(getattr(args, "session_overrides", {}))
+        or bool(getattr(args, "provider", None))
     )
 
 
@@ -476,6 +482,7 @@ def resume_params(
     params: dict[str, Any] = {
         "threadId": args.thread,
         "model": args.model,
+        "modelProvider": getattr(args, "provider", None),
         "serviceTier": args.service_tier,
         "cwd": str(Path(args.cwd).expanduser().resolve()) if args.cwd else None,
         "excludeTurns": True,
@@ -498,6 +505,7 @@ def validate_resume_response(
 ) -> None:
     expected = {
         "model": args.model,
+        "modelProvider": getattr(args, "provider", None),
         "reasoningEffort": expected_effort if expected_effort is not None else args.effort,
         "serviceTier": args.service_tier,
     }
@@ -650,6 +658,11 @@ async def create_or_fork(args: argparse.Namespace, *, fork: bool) -> dict[str, A
         else:
             result = await client.request("thread/start", thread_creation_params(args))
         thread_id = result["thread"]["id"]
+        binding = session_profiles.save_binding(args, thread_id)
+        try:
+            validate_resume_response(args, result)
+        except ChannelError as exc:
+            raise ChannelError(f"created thread {thread_id}, but configuration verification failed; no task sent: {exc}") from exc
         await client.request("thread/name/set", {"threadId": thread_id, "name": args.title})
         turn_args = argparse.Namespace(
             thread=thread_id,
@@ -665,6 +678,9 @@ async def create_or_fork(args: argparse.Namespace, *, fork: bool) -> dict[str, A
         )
         receipt: dict[str, Any] = {
             "threadId": thread_id,
+            "modelProvider": result.get("modelProvider"),
+            "providerVerified": result.get("modelProvider") == getattr(args, "provider", None) if getattr(args, "provider", None) else None,
+            "configBinding": binding,
             "title": args.title,
             "createdBy": "thread/fork" if fork else "thread/start",
             "sourceThreadId": args.from_thread if fork else None,
@@ -686,12 +702,12 @@ async def command_resume(args: argparse.Namespace) -> dict[str, Any]:
         if active_turn_id(thread) is not None:
             raise ChannelError("resume requires an idle task; the target has an active turn")
         status = thread_status(thread)
-        if status not in {"idle", "notLoaded"}:
+        if status not in {"idle", "notLoaded", "systemError"}:
             raise ChannelError(
                 f"resume requires an idle or not-loaded task; current status is {status}"
             )
 
-        if status == "idle" and has_session_only_overrides(args) and not args.cold_replace:
+        if status != "notLoaded" and has_session_only_overrides(args) and not args.cold_replace:
             raise ChannelError(
                 "the task is already loaded; context-window and auto-compaction overrides "
                 "require --cold-replace, or retry after the task becomes notLoaded"
@@ -701,7 +717,7 @@ async def command_resume(args: argparse.Namespace) -> dict[str, Any]:
         probe_effort: str | None = None
         baseline_effort: str | None = None
         turn_effort = args.effort
-        if status == "idle" and args.cold_replace:
+        if status != "notLoaded" and args.cold_replace:
             baseline = await client.request(
                 "thread/resume",
                 {"threadId": args.thread, "excludeTurns": True},
@@ -755,12 +771,16 @@ async def command_resume(args: argparse.Namespace) -> dict[str, Any]:
             cwd=args.cwd,
         )
         message_id = str(uuid.uuid4())
+        binding = session_profiles.save_binding(args, args.thread)
         delivery = await start_turn(client, turn_args, message, message_id)
         observed_context_window = await observe_task_context_window(
             args.thread, delivery["turnId"]
         )
         receipt: dict[str, Any] = {
             "threadId": args.thread,
+            "modelProvider": resumed.get("modelProvider"),
+            "providerVerified": resumed.get("modelProvider") == getattr(args, "provider", None) if getattr(args, "provider", None) else None,
+            "configBinding": binding,
             "preResumeStatus": status,
             "coldReplaceRequested": args.cold_replace,
             "coldReplaceUsed": cold_replace_used,
@@ -872,6 +892,9 @@ def positive_int(value: str) -> int:
 
 def add_session_config_args(parser: argparse.ArgumentParser) -> None:
     add_turn_config_args(parser)
+    parser.add_argument("--provider", help="explicit session provider id")
+    parser.add_argument("--agent-config", help="registered role id imported as a new session config")
+    parser.add_argument("--config-file", help="TOML session settings; kept as a persistent local reference")
     parser.add_argument("--context-window", type=positive_int)
     parser.add_argument("--auto-compact-token-limit", type=positive_int)
 
@@ -947,6 +970,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     args.socket = args.socket.expanduser().resolve()
+    if args.command in {"create", "fork", "resume"}:
+        session_profiles.prepare(args)
     if args.command == "doctor":
         return await command_doctor(args)
     if args.command == "create":
@@ -967,8 +992,21 @@ def main() -> int:
     args = parser.parse_args()
     try:
         result = asyncio.run(run(args))
-    except (ChannelError, OSError, json.JSONDecodeError) as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+    except (ChannelError, OSError, ValueError) as exc:
+        # Provider RPC errors may echo configuration; never emit secret values.
+        error = str(exc)
+        def redact(value):
+            nonlocal error
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(item, str) and any(word in key.lower() for word in ('token', 'key', 'authorization', 'secret')):
+                        error = error.replace(item, '[REDACTED]') if item else error
+                    else:
+                        redact(item)
+        redact(getattr(args, 'session_overrides', {}))
+        if isinstance(exc, ValueError):
+            error = 'Invalid session configuration (check TOML and supported fields)' if 'TOML' in type(exc).__name__ else error
+        print(json.dumps({"ok": False, "error": error}, ensure_ascii=False), file=sys.stderr)
         return 1
     print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, indent=2))
     return 0

@@ -130,9 +130,35 @@ the requested nominal window, the expected effective window after max-window
 clamping and percentage adjustment from `models_cache.json`, and the observed
 effective window.
 
-These overrides configure the current Session. Codex does not persist context
-window or auto-compaction settings as durable task metadata; a future cold
-resume must resend them when they still matter.
+These overrides configure the current Session. Current source can restore model,
+provider ID and reasoning effort from thread metadata when no model-family
+override is supplied. This does not persist arbitrary provider definitions,
+credential overrides, context or auto-compaction settings. Helper bindings
+explicitly reload those references on resume; direct Desktop resume bypasses this.
+
+## Explicit session config inputs and bindings
+
+`--provider` maps to `modelProvider` on thread/start, thread/fork and thread/resume.
+`--agent-config` reads a registered role's file; `--config-file` reads a dedicated
+TOML file. The imported subset is model, model_provider, model_reasoning_effort,
+service_tier, model_context_window, model_auto_compact_token_limit,
+developer_instructions and model_providers. Other role settings are not copied;
+unknown keys in an explicit config file are rejected. Permission and tool settings
+are intentionally outside this interface. Explicit CLI settings win over the
+config file, which wins over imported role values. Provider definitions merge
+global and local values, retaining only the selected provider.
+
+The helper sends these through the Session config map, verifies returned model,
+provider, effort and service tier before turn/start, and verifies context through
+the matching task_started event afterwards. Actual HTTP authentication is not
+exposed by the response; no claim of credential-use verification should be based
+only on READY. Provider mismatch returns the created thread ID and sends no task.
+
+Private `task-channel/threads/ID.json` bindings store references and non-secret CLI
+overrides, never credential/config snapshots. Sources are read again at resume.
+Bindings are socket-scoped, atomically written with 0600 permissions, and survive
+process exit. They do not intercept Desktop or ordinary send calls. Loaded bound
+resumes require cold replacement and retain the native subscriber/canary limits.
 
 `turn/steer` has no model, effort, service-tier, or session-config fields.
 Reject a steer request that claims to enforce those settings. A context-window
