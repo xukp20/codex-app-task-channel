@@ -40,6 +40,7 @@ selecting a delivery mode, diagnosing protocol drift, or scripting a fork.
 | Deliver only after the task becomes idle | `send --mode queue` | Store a durable later message through `codex queue` |
 | Reopen or reconfigure an existing task | `resume` | Require idle/not-loaded state, resolve Session configuration, then start a new turn |
 | Inspect without loading or messaging | `read` | Return compact task status and recent user/agent messages |
+| Block until a task's turn ends | `wait` | Read-only; see "Wait for a task's turn" |
 | Find a task by name, directory, or provider | `list` | List tasks across all model providers, newest first |
 
 Do not treat `resume` as immediate messaging or as a durable queue. It works at
@@ -214,6 +215,31 @@ conversation messages and `lastAgentMessage`:
 python scripts/task_channel.py send \
   --thread THREAD_ID --mode followup --wait --message 'Reply READY.'
 ```
+
+## Wait for a task's turn
+
+An orchestrating task can block its own turn on a sub-task with `wait`, or with
+`send --wait` right after sending. `wait` is read-only: it never loads or
+resumes the task and never starts a turn.
+
+```bash
+python scripts/task_channel.py wait --thread THREAD_ID --turn TURN_ID --timeout 7200
+python scripts/task_channel.py wait --name 'Build Trace' --next --format text
+```
+
+- `--turn ID` waits for that turn; otherwise the running turn; with `--next`
+  and none running, the next turn; with neither, the last result returns at
+  once with `"alreadyIdle": true`. A `notLoaded` task has no running turn.
+- `--timeout` (`--wait-timeout` on sending commands) defaults to 3600 seconds;
+  `0` waits without a limit. A timeout leaves the other task running; the
+  output names `threadId` and `turnId` to continue with `wait --turn`.
+- Disconnects and App restarts are retried with backoff until the deadline;
+  unknown targets and protocol errors fail at once.
+- Exit codes for `wait` and every `--wait`: 0 completed, 1 helper error,
+  2 usage error, 3 turn failed, 4 turn interrupted, 5 wait timed out.
+- The caller's own shell-command timeout must exceed the wait, or the caller
+  cuts the command off first. Set it above `--timeout`, or use `--timeout 0`
+  with a tool that allows an unlimited command.
 
 `turn/steer` cannot change the active turn's model, reasoning effort, service
 tier, or context window. Model, effort, and service tier can be selected on a

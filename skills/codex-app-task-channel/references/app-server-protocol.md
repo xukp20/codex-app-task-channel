@@ -29,6 +29,7 @@ for raw `recv()` calls; doing so can consume another request's response or lose
 | `resume` | `thread/read`, `thread/resume`, `turn/start` | Target must be idle or not loaded |
 | `resume --cold-replace` | two `thread/resume` calls, `thread/unsubscribe`, `turn/start` | Loaded target must be idle; caller explicitly opts in |
 | `read` | `thread/read`, `thread/turns/list(itemsView=full)` | Read-only |
+| `wait` | `thread/read(includeTurns=false)`, `thread/turns/list(itemsView=notLoaded)`, then `thread/turns/list(itemsView=full)` once the turn is terminal | Read-only; never loads, resumes, or subscribes |
 | `send --mode start` | `turn/start` | No active turn |
 | `send --mode steer` | `turn/steer(expectedTurnId=...)` | Matching active turn |
 | `send --mode followup` | Read, then steer or start | Race-aware |

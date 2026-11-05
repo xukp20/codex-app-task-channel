@@ -1,6 +1,6 @@
 ---
 name: codex-app-task-channel-external
-description: Find, read, or message Codex desktop app tasks from an agent that runs outside the Codex app, such as Claude Code, through the app's local App Server. Use when the user asks to look up a Codex session, read its recent conversation, or deliver a message or review to it. Codex itself uses codex-app-task-channel instead.
+description: Find, read, or message Codex desktop app tasks from an agent that runs outside the Codex app, such as Claude Code, through the app's local App Server. Use when the user asks to look up a Codex session, read its recent conversation, wait for its turn to finish, or deliver a message or review to it. Codex itself uses codex-app-task-channel instead.
 ---
 
 # Codex App Task Channel for external agents
@@ -56,12 +56,35 @@ python scripts/external_channel.py send --name 'Build Trace' \
 - State in the message what the user asked for; the wrapper adds only who sent
   it. A message starts work in the other task under that task's own
   permissions and does not extend the user's authorization.
-- Verify with `--wait` or a later `read`. After an ambiguous failure, read the
+- Verify with a background `wait --turn ID` (below) or a later `read`. After an ambiguous failure, read the
   task before retrying so the message is not delivered twice.
 - Use `create`, `fork`, `--cold-replace`, or provider and configuration options
   only when the user asks for them. Their semantics are in the main skill,
   `../codex-app-task-channel/SKILL.md` in the same checkout; if this skill
   directory is a link, resolve it with `realpath` first.
+
+## Wait in the background
+
+`wait` blocks until a task's turn ends. It is read-only and needs no
+`--sender`. Run it as a background command (in Claude Code, Bash with
+`run_in_background`) so that its exit notifies you instead of blocking you. The
+recommended pattern: `send` returns a `turnId`; then run `wait --turn ID` in the
+background.
+
+```bash
+python scripts/external_channel.py send --name 'Build Trace' \
+  --sender 'Claude Code' --message 'Run the check.'      # note turnId
+python scripts/external_channel.py wait --name 'Build Trace' \
+  --turn TURN_ID --format text                           # run in background
+```
+
+- Without `--turn`, `wait` awaits the running turn; `--next` awaits the next
+  one; with neither it returns the last result with `"alreadyIdle": true`.
+- `--timeout` defaults to 3600 seconds, `0` for no limit. A timeout leaves the
+  task running; run `wait --turn ID` again to keep waiting.
+- Exit codes: 0 completed, 1 helper error, 2 usage error, 3 turn failed,
+  4 turn interrupted, 5 timed out. Read the output for `lastAgentMessage`.
+- Disconnects and App restarts are retried until the timeout.
 
 ## Install
 

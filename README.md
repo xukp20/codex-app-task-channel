@@ -129,6 +129,45 @@ Add `--wait` to `send`, `create`, `fork`, or `resume` when the caller needs a
 completed-turn receipt containing conversation messages and
 `lastAgentMessage`, rather than only an accepted turn id.
 
+## Wait for a Turn
+
+`wait` is read-only: it never loads, resumes, or subscribes to a task and never
+starts a turn. It blocks until a turn finishes and reports `threadId`, `turnId`,
+`status`, `error`, and `lastAgentMessage`.
+
+```bash
+python skills/codex-app-task-channel/scripts/task_channel.py wait \
+  --name 'Build Trace' --timeout 7200 --format text
+python skills/codex-app-task-channel/scripts/task_channel.py wait \
+  --thread THREAD_ID --turn TURN_ID
+```
+
+- `--turn ID` waits for that turn. Otherwise a running turn is awaited; with
+  `--next` and no running turn, the next turn to start and finish is awaited;
+  with neither, the last turn's result returns at once with `"alreadyIdle": true`.
+  A `notLoaded` task counts as having no running turn.
+- `--timeout` and `--wait-timeout` default to 3600 seconds; `0` waits without a
+  limit. A timeout only ends the wait: the other task keeps running, and the
+  output names its `threadId` and `turnId` so `wait --turn` can continue.
+- A lost connection or an App restart is not the end of a turn. The helper
+  reconnects with backoff (2 s growing to 30 s) until the deadline. Logic errors
+  such as an unknown task or a protocol error fail immediately.
+- Waiting polls turn status without items, backing off to 15 s and checking at
+  once on a notification; full items are fetched once, after the turn finishes.
+- `--format text` prints a short summary; `--max-chars` (default 2000) truncates
+  the last agent message.
+
+Exit codes of `wait` and of every `--wait`:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Turn completed |
+| 1 | Helper error (bad target, protocol error, unreachable App Server) |
+| 2 | Usage error |
+| 3 | Turn failed |
+| 4 | Turn interrupted |
+| 5 | Wait timed out; the other task is still running |
+
 ## Read Task Content
 
 ```bash
@@ -191,8 +230,9 @@ Agents that run outside the Codex app, such as Claude Code, install the optional
 main one. Its `scripts/external_channel.py` reuses the main helper with the same
 commands, and requires `--sender NAME` on every command that sends a message;
 the message is then prefixed with a line naming the sender, so the receiving
-task does not mistake it for the user or for another Codex task. Reading and
-listing need no sender.
+task does not mistake it for the user or for another Codex task. Reading,
+listing, and `wait` need no sender; run `wait` as a background command to be
+notified when a task's turn ends.
 
 ```bash
 git clone https://github.com/xukp20/codex-app-task-channel.git \
