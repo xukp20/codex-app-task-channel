@@ -618,7 +618,7 @@ class FakeWaitClient:
             turn if items_view == "full" else {k: v for k, v in turn.items() if k != "items"}
             for turn in self.turns[:limit]
         ]
-        return {"data": data, "nextCursor": None}
+        return {"data": data, "nextCursor": getattr(self, "next_cursor", None)}
 
     async def reconnect(self):
         self.reconnects += 1
@@ -664,6 +664,9 @@ class WaitCommandTests(unittest.IsolatedAsyncioTestCase):
         result = await self.wait(client, "--turn", "a")
         self.assertEqual((result["turnId"], result["lastAgentMessage"], result["alreadyIdle"]), ("a", "old", False))
         with self.assertRaisesRegex(task_channel.ChannelError, "not found"):
+            await self.wait(client, "--turn", "zzz")
+        client.next_cursor = "older"
+        with self.assertRaisesRegex(task_channel.ChannelError, "not found in the latest 50 turns"):
             await self.wait(client, "--turn", "zzz")
 
     async def test_next_waits_for_a_new_turn(self):

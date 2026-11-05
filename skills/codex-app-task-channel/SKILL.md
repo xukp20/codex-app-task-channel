@@ -233,8 +233,9 @@ python scripts/task_channel.py wait --name 'Build Trace' --next --format text
 - `--timeout` (`--wait-timeout` on sending commands) defaults to 3600 seconds;
   `0` waits without a limit. A timeout leaves the other task running; the
   output names `threadId` and `turnId` to continue with `wait --turn`.
-- Disconnects and App restarts are retried with backoff until the deadline;
-  unknown targets and protocol errors fail at once.
+- Disconnects and App restarts after the first connection are retried with
+  backoff until the deadline; an unreachable App at start, unknown targets, and
+  protocol errors fail at once.
 - Exit codes for `wait` and every `--wait`: 0 completed, 1 helper error,
   2 usage error, 3 turn failed, 4 turn interrupted, 5 wait timed out.
 - The caller's own shell-command timeout must exceed the wait, or the caller

@@ -84,7 +84,8 @@ python scripts/external_channel.py wait --name 'Build Trace' \
   task running; run `wait --turn ID` again to keep waiting.
 - Exit codes: 0 completed, 1 helper error, 2 usage error, 3 turn failed,
   4 turn interrupted, 5 timed out. Read the output for `lastAgentMessage`.
-- Disconnects and App restarts are retried until the timeout.
+- Disconnects and App restarts after the first connection are retried until
+  the timeout; an App that is unreachable at start fails with exit 1.
 
 ## Install
 

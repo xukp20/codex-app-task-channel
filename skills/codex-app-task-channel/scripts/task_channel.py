@@ -1245,8 +1245,9 @@ async def wait_on_thread(
             deadline,
             lambda: client.list_turns(thread_id, limit=WAIT_PAGE_LIMIT, items_view="notLoaded"),
         )
-        if not any(t.get("id") == turn_id for t in found.get("data", [])) and not found.get("nextCursor"):
-            raise ChannelError(f"turn {turn_id} not found in task {thread_id}")
+        if not any(t.get("id") == turn_id for t in found.get("data", [])):
+            scope = f"the latest {WAIT_PAGE_LIMIT} turns of " if found.get("nextCursor") else ""
+            raise ChannelError(f"turn {turn_id} not found in {scope}task {thread_id}")
     if not already_idle:
         result = await wait_for_terminal(client, thread_id, turn_id, None, deadline=deadline)
     summary = {

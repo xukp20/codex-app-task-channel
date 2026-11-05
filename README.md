@@ -149,9 +149,10 @@ python skills/codex-app-task-channel/scripts/task_channel.py wait \
 - `--timeout` and `--wait-timeout` default to 3600 seconds; `0` waits without a
   limit. A timeout only ends the wait: the other task keeps running, and the
   output names its `threadId` and `turnId` so `wait --turn` can continue.
-- A lost connection or an App restart is not the end of a turn. The helper
-  reconnects with backoff (2 s growing to 30 s) until the deadline. Logic errors
-  such as an unknown task or a protocol error fail immediately.
+- A lost connection or an App restart is not the end of a turn. Once
+  connected, the helper reconnects with backoff (2 s growing to 30 s) until the deadline. Logic errors
+  such as an unknown task or a protocol error fail immediately, as does an App
+  that is unreachable when the command starts.
 - Waiting polls turn status without items, backing off to 15 s and checking at
   once on a notification; full items are fetched once, after the turn finishes.
 - `--format text` prints a short summary; `--max-chars` (default 2000) truncates

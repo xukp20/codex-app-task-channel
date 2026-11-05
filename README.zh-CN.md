@@ -107,7 +107,7 @@ python skills/codex-app-task-channel/scripts/task_channel.py wait \
 
 - `--turn ID` 等待指定 turn。否则等待正在运行的 turn；没有运行中的 turn 时，加 `--next` 会等待下一个 turn 开始并结束；两者都没有则立即返回最后一个 turn 的结果，并带 `"alreadyIdle": true`。`notLoaded` 的任务视为没有运行中的 turn。
 - `--timeout` 与 `--wait-timeout` 默认 3600 秒，`0` 表示不限时。超时只结束等待，对方任务继续运行；输出会给出 `threadId` 和 `turnId`，可用 `wait --turn` 继续等。
-- 连接断开或 App 重启不算 turn 结束。helper 按退避（2 秒逐步增至 30 秒）重连，直到截止时间；目标不存在、协议错误等逻辑错误立即报错。
+- 连接断开或 App 重启不算 turn 结束。首次连上之后，helper 按退避（2 秒逐步增至 30 秒）重连，直到截止时间；目标不存在、协议错误等逻辑错误，以及启动时 App 不可达，都立即报错。
 - 等待期间用不含 items 的轻量状态轮询，间隔逐步增至 15 秒，收到通知时立即检查；turn 结束后才取一次完整 items。
 - `--format text` 输出简短摘要，`--max-chars`（默认 2000）截断最后一条回复。
 
