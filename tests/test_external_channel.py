@@ -55,6 +55,15 @@ class ExternalChannelTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIsNone(args)
 
+    def test_wait_is_read_only_and_rejects_sender(self) -> None:
+        code, args = self.run_main(["wait", "--thread", "t", "--turn", "x"])
+        self.assertEqual(code, 0)
+        self.assertEqual(args.turn, "x")
+        self.assertEqual(args.timeout, 3600)
+        code, args = self.run_main(["wait", "--thread", "t", "--sender", "Claude Code"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(args)
+
     def test_external_sender_cannot_claim_a_codex_source_task(self) -> None:
         code, args = self.run_main(
             ["send", "--thread", "t", "--sender=Claude Code", "--source-thread", "x", "--message", "hi"]

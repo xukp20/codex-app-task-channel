@@ -29,6 +29,14 @@ class ChannelError(RuntimeError):
     """A task-channel operation failed without a safe automatic fallback."""
 
 
+class ConnectionLost(ChannelError):
+    """The app-server transport is gone or unreachable; waits reconnect, others fail."""
+
+
+class WaitExpired(Exception):
+    """Internal: the wait deadline passed while reconnecting."""
+
+
 class TaskStateUncertain(ChannelError):
     """Read-only snapshots do not establish a safe delivery state."""
 
@@ -52,46 +60,77 @@ class AppServerClient:
         self._reader_task: asyncio.Task[None] | None = None
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 1
+        self._lost: str | None = None
         self.notifications: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def __aenter__(self) -> Self:
+        await self._connect()
+        return self
+
+    async def _connect(self) -> None:
         if unix_connect is None:
             raise ChannelError(
                 "Python dependency 'websockets' is missing; install websockets>=14,<17"
             )
         if not self.socket_path.is_socket():
-            raise ChannelError(f"Codex app-server socket not found: {self.socket_path}")
-        self._ws = await unix_connect(
-            path=str(self.socket_path),
-            uri="ws://localhost/rpc",
-            compression=None,
-            max_size=None,
-            open_timeout=self.timeout,
-        )
+            raise ConnectionLost(f"Codex app-server socket not found: {self.socket_path}")
+        self._lost = None
+        try:
+            self._ws = await unix_connect(
+                path=str(self.socket_path),
+                uri="ws://localhost/rpc",
+                compression=None,
+                max_size=None,
+                open_timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - any connect failure is a transport failure
+            raise ConnectionLost(f"cannot connect to the Codex app-server: {exc!r}") from exc
         self._reader_task = asyncio.create_task(self._reader())
-        await self.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "codex-app-task-channel",
-                    "title": "Codex App Task Channel",
-                    "version": "0.1.0",
+        try:
+            await self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "codex-app-task-channel",
+                        "title": "Codex App Task Channel",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {"experimentalApi": True},
                 },
-                "capabilities": {"experimentalApi": True},
-            },
-        )
-        await self.notify("initialized")
-        return self
+            )
+            await self.notify("initialized")
+        except BaseException:
+            await self._close()
+            raise
+
+    async def reconnect(self) -> None:
+        """Drop the dead transport and open a fresh one; notifications stay queued."""
+        await self._close()
+        await self._connect()
+
+    async def _close(self) -> None:
+        ws, self._ws = self._ws, None
+        task, self._reader_task = self._reader_task, None
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._fail_pending("app-server connection closed")
 
     async def __aexit__(self, *_exc: object) -> None:
-        if self._ws is not None:
-            await self._ws.close()
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reader_task
+        await self._close()
+
+    def _fail_pending(self, reason: str) -> None:
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(ConnectionLost(reason))
+        self._pending.clear()
 
     async def _reader(self) -> None:
+        reason = "app-server connection closed"
         try:
             async for raw in self._ws:
                 message = json.loads(raw)
@@ -107,24 +146,33 @@ class AppServerClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - fail every pending RPC on transport loss
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(ChannelError(f"app-server connection failed: {exc}"))
-            self._pending.clear()
+            reason = f"app-server connection failed: {exc}"
+        self._lost = reason
+        self._fail_pending(reason)
+        # Wake any waiter sleeping on notifications so it notices the loss now.
+        self.notifications.put_nowait({"method": "connection/lost"})
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
+        if self._lost is not None:
+            raise ConnectionLost(self._lost)
         request_id = self._next_id
         self._next_id += 1
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._ws.send(
-            json.dumps(
-                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
-                separators=(",", ":"),
-            )
-        )
         try:
-            return await asyncio.wait_for(future, timeout=self.timeout)
+            try:
+                await self._ws.send(
+                    json.dumps(
+                        {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+                        separators=(",", ":"),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - a failed send is a transport failure
+                raise ConnectionLost(f"app-server connection failed: {exc!r}") from exc
+            try:
+                return await asyncio.wait_for(future, timeout=self.timeout)
+            except TimeoutError as exc:
+                raise ConnectionLost(f"{method} timed out after {self.timeout}s") from exc
         except RpcError as exc:
             exc.method = method
             exc.args = (f"{method} failed: {json.dumps(exc.error, ensure_ascii=False)}",)
@@ -136,7 +184,10 @@ class AppServerClient:
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             message["params"] = params
-        await self._ws.send(json.dumps(message, separators=(",", ":")))
+        try:
+            await self._ws.send(json.dumps(message, separators=(",", ":")))
+        except Exception as exc:  # noqa: BLE001 - a failed send is a transport failure
+            raise ConnectionLost(f"app-server connection failed: {exc!r}") from exc
 
     async def read_thread(self, thread_id: str) -> dict[str, Any]:
         before = await self.request(
@@ -432,43 +483,206 @@ async def followup_turn(
         return await steer_turn(client, args, message, message_id, current)
 
 
+# Exit codes shared by `wait` and every `--wait`. 1 is any helper error and 2 a
+# usage error (argparse, external wrapper); the rest report the awaited turn.
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_TURN_FAILED = 3
+EXIT_TURN_INTERRUPTED = 4
+EXIT_WAIT_TIMEOUT = 5
+
+DEFAULT_WAIT_TIMEOUT = 3600.0
+WAIT_PAGE_LIMIT = 50
+WAIT_POLL_MIN = 1.0
+WAIT_POLL_MAX = 15.0
+RECONNECT_MIN = 2.0
+RECONNECT_MAX = 30.0
+
+
+def deadline_after(timeout: float | None) -> float | None:
+    """Absolute loop-time deadline; a falsy timeout means wait without a limit."""
+    if not timeout:
+        return None
+    return asyncio.get_running_loop().time() + timeout
+
+
+def time_left(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - asyncio.get_running_loop().time()
+
+
+async def reconnect_until(client: AppServerClient, deadline: float | None) -> bool:
+    """Reconnect with backoff until it works or the deadline passes."""
+    backoff = RECONNECT_MIN
+    while True:
+        pause = backoff
+        remaining = time_left(deadline)
+        if remaining is not None:
+            if remaining <= 0:
+                return False
+            pause = min(pause, remaining)
+        await asyncio.sleep(pause)
+        try:
+            await client.reconnect()
+            return True
+        except ConnectionLost:
+            backoff = min(backoff * 2, RECONNECT_MAX)
+
+
+async def with_reconnect(
+    client: AppServerClient, deadline: float | None, operation: Callable[[], Any]
+) -> Any:
+    """Run a read-only operation, reconnecting after transport loss only.
+
+    Logic errors (RpcError, other ChannelError) propagate unchanged.
+    """
+    while True:
+        try:
+            return await operation()
+        except ConnectionLost:
+            if not await reconnect_until(client, deadline):
+                raise WaitExpired from None
+
+
+async def sleep_or_notified(
+    client: AppServerClient, delay: float, remaining: float | None
+) -> None:
+    """Sleep up to ``delay`` seconds, returning early on a state notification."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + (delay if remaining is None else min(delay, remaining))
+    while True:
+        left = end - loop.time()
+        if left <= 0:
+            return
+        try:
+            note = await asyncio.wait_for(client.notifications.get(), timeout=left)
+        except TimeoutError:
+            return
+        method = str(note.get("method", "")) if isinstance(note, dict) else ""
+        if not (method.startswith("item/") or "delta" in method.lower()):
+            break
+    while not client.notifications.empty():
+        client.notifications.get_nowait()
+
+
+async def poll_until(
+    client: AppServerClient, deadline: float | None, step: Callable[[], Any]
+) -> Any:
+    """Call ``step`` until it returns a value that is not None; None means timed out."""
+    delay = WAIT_POLL_MIN
+    try:
+        while True:
+            value = await with_reconnect(client, deadline, step)
+            if value is not None:
+                return value
+            remaining = time_left(deadline)
+            if remaining is not None and remaining <= 0:
+                return None
+            await sleep_or_notified(client, delay, remaining)
+            delay = min(delay * 1.5, WAIT_POLL_MAX)
+    except WaitExpired:
+        return None
+
+
+def timeout_result(thread_id: str, turn_id: str | None) -> dict[str, Any]:
+    target = f"--turn {turn_id}" if turn_id else "--next"
+    return {
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "status": "inProgress" if turn_id else "notStarted",
+        "timedOut": True,
+        "error": None,
+        "lastAgentMessage": None,
+        "note": (
+            "wait timed out; the other task is still running and was not affected; "
+            f"continue with: wait --thread {thread_id} {target}"
+        ),
+    }
+
+
+def terminal_result(
+    thread_id: str, turn: dict[str, Any], *, status: Any = None, error: Any = None
+) -> dict[str, Any]:
+    messages = conversation_messages(turn)
+    return {
+        "threadId": thread_id,
+        "turnId": turn.get("id"),
+        "status": status or turn.get("status"),
+        "error": error if status else turn.get("error"),
+        "messages": messages,
+        "lastAgentMessage": last_agent_message(messages),
+    }
+
+
+async def find_turn(
+    client: AppServerClient, thread_id: str, turn_id: str
+) -> tuple[int, dict[str, Any]] | None:
+    page = await client.list_turns(thread_id, limit=WAIT_PAGE_LIMIT, items_view="notLoaded")
+    for index, turn in enumerate(page.get("data", [])):
+        if turn.get("id") == turn_id:
+            return index, turn
+    return None
+
+
+async def settled_turn(
+    client: AppServerClient, thread_id: str, turn_id: str
+) -> dict[str, Any] | None:
+    """The terminal result for the turn, or None while it is not finished."""
+    found = await find_turn(client, thread_id, turn_id)
+    if found is None:
+        return None
+    index, light = found
+    status = light.get("status")
+    if status in {None, "inProgress"}:
+        return None
+    override: dict[str, Any] = {}
+    # Rollout-backed pages can briefly label an unfinished turn interrupted.
+    # Confirm against the loaded Session before treating it as terminal.
+    if status == "interrupted":
+        try:
+            thread = await client.read_thread(thread_id)
+        except TaskStateUncertain:
+            return None
+        if active_turn_id(thread) == turn_id:
+            return None
+        live = next((item for item in thread.get("turns", []) if item.get("id") == turn_id), None)
+        if live and live.get("status") in {"completed", "failed"}:
+            override = {"status": live["status"], "error": live.get("error")}
+    # Fetch full items once, for exactly the pages up to and including the turn.
+    page = await client.list_turns(thread_id, limit=index + 1, items_view="full")
+    turn = next((item for item in page.get("data", []) if item.get("id") == turn_id), light)
+    return terminal_result(thread_id, turn, **override)
+
+
 async def wait_for_terminal(
     client: AppServerClient,
     thread_id: str,
     turn_id: str,
-    timeout: float,
+    timeout: float | None,
+    *,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        page = await client.list_turns(thread_id, limit=5, items_view="full")
-        for turn in page.get("data", []):
-            if turn.get("id") == turn_id and turn.get("status") != "inProgress":
-                # Rollout-backed pages can briefly label an unfinished turn interrupted.
-                # Confirm against the loaded Session before treating it as terminal.
-                if turn.get("status") == "interrupted":
-                    try:
-                        thread = await client.read_thread(thread_id)
-                    except TaskStateUncertain:
-                        break
-                    if active_turn_id(thread) == turn_id:
-                        break
-                    live = next((item for item in thread.get("turns", []) if item.get("id") == turn_id), None)
-                    if live and live.get("status") in {"completed", "failed"}:
-                        turn = dict(turn, status=live["status"], error=live.get("error"))
-                messages = conversation_messages(turn)
-                return {
-                    "status": turn.get("status"),
-                    "error": turn.get("error"),
-                    "messages": messages,
-                    "lastAgentMessage": last_agent_message(messages),
-                }
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise ChannelError(f"timed out waiting for turn {turn_id}")
-        try:
-            await asyncio.wait_for(client.notifications.get(), timeout=min(1.0, remaining))
-        except TimeoutError:
-            pass
+    """Wait for a turn to finish; a timeout returns a ``timedOut`` result instead of raising.
+
+    Polls with itemsView=notLoaded, fetches full items once after the turn
+    settles, and survives disconnects by reconnecting with backoff.
+    """
+    if deadline is None:
+        deadline = deadline_after(timeout)
+    result = await poll_until(
+        client, deadline, lambda: settled_turn(client, thread_id, turn_id)
+    )
+    return result if result is not None else timeout_result(thread_id, turn_id)
+
+
+async def wait_for_new_turn(
+    client: AppServerClient, thread_id: str, known: set[str], deadline: float | None
+) -> str | None:
+    async def step() -> str | None:
+        page = await client.list_turns(thread_id, limit=5, items_view="notLoaded")
+        fresh = [t["id"] for t in page.get("data", []) if t.get("id") not in known]
+        return fresh[-1] if fresh else None
+
+    return await poll_until(client, deadline, step)
 
 
 def conversation_messages(turn: dict[str, Any]) -> list[dict[str, Any]]:
@@ -974,6 +1188,77 @@ async def command_read(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+async def command_wait(args: argparse.Namespace) -> dict[str, Any]:
+    """Read-only: never loads, resumes, or subscribes to the task, and starts no turn."""
+    deadline = deadline_after(args.timeout)
+    async with AppServerClient(args.socket, timeout=args.rpc_timeout) as client:
+        try:
+            return await wait_on_thread(client, args, deadline)
+        except WaitExpired:
+            return timeout_result(args.thread, args.turn)
+
+
+async def wait_on_thread(
+    client: AppServerClient, args: argparse.Namespace, deadline: float | None
+) -> dict[str, Any]:
+    thread_id = args.thread
+
+    async def snapshot() -> tuple[str, list[dict[str, Any]], str | None]:
+        meta = (
+            await client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+        )["thread"]
+        page = await client.list_turns(thread_id, limit=5, items_view="notLoaded")
+        turns = page.get("data", [])
+        status = thread_status(meta)
+        # A task that is not loaded cannot be running a turn, whatever a stale rollout says.
+        active = None if status == "notLoaded" else active_turn_id({"turns": turns})
+        return status, turns, active
+
+    turn_id: str | None = args.turn
+    already_idle = False
+    if turn_id is None:
+        _status, turns, active = await with_reconnect(client, deadline, snapshot)
+        if active is not None:
+            turn_id = active
+        elif args.next:
+            known = {t.get("id") for t in turns}
+            turn_id = await wait_for_new_turn(client, thread_id, known, deadline)
+            if turn_id is None:
+                return timeout_result(thread_id, None)
+        else:
+            already_idle = True
+            page = await with_reconnect(
+                client,
+                deadline,
+                lambda: client.list_turns(thread_id, limit=1, items_view="full"),
+            )
+            data = page.get("data", [])
+            if not data:
+                return {
+                    "threadId": thread_id, "turnId": None, "status": "noTurns",
+                    "error": None, "lastAgentMessage": None, "alreadyIdle": True,
+                }
+            result = terminal_result(thread_id, data[0])
+    else:
+        found = await with_reconnect(
+            client,
+            deadline,
+            lambda: client.list_turns(thread_id, limit=WAIT_PAGE_LIMIT, items_view="notLoaded"),
+        )
+        if not any(t.get("id") == turn_id for t in found.get("data", [])) and not found.get("nextCursor"):
+            raise ChannelError(f"turn {turn_id} not found in task {thread_id}")
+    if not already_idle:
+        result = await wait_for_terminal(client, thread_id, turn_id, None, deadline=deadline)
+    summary = {
+        key: result.get(key)
+        for key in ("threadId", "turnId", "status", "error", "lastAgentMessage")
+    }
+    summary["alreadyIdle"] = already_idle
+    if result.get("timedOut"):
+        summary.update(timedOut=True, note=result["note"])
+    return summary
+
+
 async def command_list(args: argparse.Namespace) -> dict[str, Any]:
     cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else None
     async with AppServerClient(args.socket, timeout=args.rpc_timeout) as client:
@@ -1006,6 +1291,26 @@ async def resolve_targets(args: argparse.Namespace) -> None:
             args.resolved_source_by_name = {"query": from_name, **thread_summary(source)}
 
 
+def render_wait_text(args: argparse.Namespace, result: dict[str, Any]) -> str:
+    state = "already idle" if result.get("alreadyIdle") else "finished"
+    if result.get("timedOut"):
+        state = "timed out"
+    lines = [
+        f"thread {result.get('threadId')} | turn {result.get('turnId')} | "
+        f"status {result.get('status')} ({state})"
+    ]
+    if result.get("note"):
+        lines.append(result["note"])
+    if result.get("error"):
+        lines.append(f"error: {json.dumps(result['error'], ensure_ascii=False)}")
+    message = result.get("lastAgentMessage")
+    if message:
+        limit = args.max_chars
+        shown = message if len(message) <= limit else message[:limit] + f"... [truncated, {len(message)} chars]"
+        lines += ["", shown.rstrip()]
+    return "\n".join(lines)
+
+
 def render_text(args: argparse.Namespace, result: dict[str, Any]) -> str:
     if args.command == "list":
         rows = result["threads"]
@@ -1018,6 +1323,8 @@ def render_text(args: argparse.Namespace, result: dict[str, Any]) -> str:
                 f"{row['threadId']}  {row.get('name') or '(unnamed)'}  [{row.get('cwd')}]"
             )
         return "\n".join(lines)
+    if args.command == "wait":
+        return render_wait_text(args, result)
     lines = [
         f"# {result.get('name') or '(unnamed task)'}",
         f"thread {result.get('threadId')} | status {result.get('status')} | cwd {result.get('cwd')}",
@@ -1075,9 +1382,21 @@ def add_session_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--auto-compact-token-limit", type=positive_int)
 
 
+def timeout_seconds(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("timeout must be >= 0 (0 means no limit)")
+    return parsed
+
+
 def add_wait_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wait", action="store_true")
-    parser.add_argument("--wait-timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--wait-timeout",
+        type=timeout_seconds,
+        default=DEFAULT_WAIT_TIMEOUT,
+        help="seconds to wait for the turn; 0 waits without a limit (default 3600)",
+    )
 
 
 def add_target_args(parser: argparse.ArgumentParser) -> None:
@@ -1159,6 +1478,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="text prints the turns oldest first as a readable transcript",
     )
 
+    wait = subparsers.add_parser(
+        "wait", help="read-only: wait for a running turn to finish and report its result"
+    )
+    add_connection_args(wait)
+    add_target_args(wait)
+    wait.add_argument("--turn", help="wait for this turn id")
+    wait.add_argument(
+        "--next",
+        action="store_true",
+        help="when no turn is running, wait for the next turn to start and finish",
+    )
+    wait.add_argument(
+        "--timeout",
+        type=timeout_seconds,
+        default=DEFAULT_WAIT_TIMEOUT,
+        help="seconds to wait; 0 waits without a limit (default 3600)",
+    )
+    wait.add_argument("--format", choices=["json", "text"], default="json")
+    wait.add_argument(
+        "--max-chars",
+        type=positive_int,
+        default=2000,
+        help="text format: truncate the last agent message to this many characters",
+    )
+
     listing = subparsers.add_parser(
         "list", help="list tasks across all model providers, newest first"
     )
@@ -1196,6 +1540,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         result = await command_send(args)
     elif args.command == "read":
         result = await command_read(args)
+    elif args.command == "wait":
+        result = await command_wait(args)
     else:
         raise AssertionError(args.command)
     if getattr(args, "resolved_by_name", None):
@@ -1203,6 +1549,21 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "resolved_source_by_name", None):
         result["resolvedSourceByName"] = args.resolved_source_by_name
     return result
+
+
+def outcome_exit_code(command: str, result: dict[str, Any]) -> int:
+    """Map the awaited turn's outcome (`wait` result or `--wait` terminal) to an exit code."""
+    outcome = result if command == "wait" else result.get("terminal")
+    if not isinstance(outcome, dict):
+        return EXIT_OK
+    if outcome.get("timedOut"):
+        return EXIT_WAIT_TIMEOUT
+    status = outcome.get("status")
+    if status == "failed":
+        return EXIT_TURN_FAILED
+    if status == "interrupted":
+        return EXIT_TURN_INTERRUPTED
+    return EXIT_OK
 
 
 def main(
@@ -1232,14 +1593,15 @@ def main(
         if isinstance(exc, ValueError):
             error = 'Invalid session configuration (check TOML and supported fields)' if 'TOML' in type(exc).__name__ else error
         print(json.dumps({"ok": False, "error": error}, ensure_ascii=False), file=sys.stderr)
-        return 1
+        return EXIT_ERROR
+    code = outcome_exit_code(args.command, result)
     if getattr(args, "format", "json") == "text":
         if getattr(args, "include_items", False):
             print("note: --include-items is omitted from text output; use --format json", file=sys.stderr)
         print(render_text(args, result))
-        return 0
+        return code
     print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, indent=2))
-    return 0
+    return code
 
 
 if __name__ == "__main__":

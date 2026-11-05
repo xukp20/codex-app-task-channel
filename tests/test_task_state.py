@@ -76,7 +76,7 @@ class TaskStateTests(unittest.TestCase):
             client = WaitingClient()
             result = await wait_for_terminal(client, "synthetic", "target", 2)
             self.assertEqual(result["status"], "completed")
-            self.assertEqual(client.calls, 2)
+            self.assertEqual(client.calls, 3)  # two light polls, one full fetch
 
         asyncio.run(run())
 

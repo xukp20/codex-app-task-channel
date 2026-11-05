@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import unittest
 import tempfile
 import os
@@ -363,6 +364,8 @@ class ReadAndWaitTests(unittest.IsolatedAsyncioTestCase):
             {'data': [{'id': 'turn', 'status': 'interrupted', 'items': []}]},
             {'data': [{'id': 'turn', 'status': 'completed', 'items': [
                 {'type': 'agentMessage', 'text': 'done', 'phase': 'final_answer'}]}]},
+            {'data': [{'id': 'turn', 'status': 'completed', 'items': [
+                {'type': 'agentMessage', 'text': 'done', 'phase': 'final_answer'}]}]},
         ])
         client.read_thread = mock.AsyncMock(return_value={'turns': [{'id': 'turn', 'status': 'inProgress'}]})
         client.notifications = asyncio.Queue()
@@ -566,6 +569,255 @@ class ListAndNameTests(unittest.IsolatedAsyncioTestCase):
         text = task_channel.render_text(args, result)
         self.assertLess(text.index("first"), text.index("second"))
         self.assertIn("### Assistant (final_answer)", text)
+
+
+def agent_turn(turn_id, status, text="done"):
+    return {
+        "id": turn_id,
+        "status": status,
+        "error": {"message": "boom"} if status == "failed" else None,
+        "items": [{"type": "agentMessage", "text": text, "phase": "final_answer"}],
+    }
+
+
+class FakeWaitClient:
+    """Read-only fake server. ``turns`` is newest first; ``script`` runs on each turns/list."""
+
+    def __init__(self, status="idle", turns=(), script=None):
+        self.status = status
+        self.turns = list(turns)
+        self.script = script
+        self.list_calls = 0
+        self.requests = []
+        self.reconnects = 0
+        self.notifications = asyncio.Queue()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return None
+
+    async def request(self, method, params):
+        self.requests.append(method)
+        if method == "thread/read":
+            return {"thread": {"id": params["threadId"], "cwd": "/", "status": {"type": self.status}}}
+        if method == "turn/start":
+            return {"turn": {"id": "new"}}
+        raise AssertionError(f"unexpected rpc {method}")
+
+    async def read_thread(self, _thread_id):
+        return {"turns": []}
+
+    async def list_turns(self, _thread_id, *, limit, items_view):
+        self.list_calls += 1
+        self.requests.append(f"turns:{items_view}")
+        if self.script:
+            self.script(self)
+        data = [
+            turn if items_view == "full" else {k: v for k, v in turn.items() if k != "items"}
+            for turn in self.turns[:limit]
+        ]
+        return {"data": data, "nextCursor": None}
+
+    async def reconnect(self):
+        self.reconnects += 1
+
+
+class WaitCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        for name, value in {
+            "WAIT_POLL_MIN": 0.01, "WAIT_POLL_MAX": 0.02,
+            "RECONNECT_MIN": 0.01, "RECONNECT_MAX": 0.02,
+        }.items():
+            patcher = mock.patch.object(task_channel, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def parse(self, *argv):
+        args = task_channel.build_parser().parse_args(["wait", "--thread", "t", *argv])
+        args.socket = Path("/app.sock")
+        return args
+
+    async def wait(self, client, *argv):
+        with mock.patch.object(task_channel, "AppServerClient", return_value=client):
+            return await task_channel.command_wait(self.parse(*argv))
+
+    async def test_active_turn_is_awaited_with_light_polls_then_one_full_fetch(self):
+        def script(client):
+            if client.list_calls >= 4:
+                client.turns[0] = agent_turn("a", "completed", "all done")
+
+        client = FakeWaitClient("active", [{"id": "a", "status": "inProgress", "items": []}], script)
+        result = await self.wait(client, "--timeout", "5")
+        self.assertEqual(
+            (result["turnId"], result["status"], result["lastAgentMessage"], result["alreadyIdle"]),
+            ("a", "completed", "all done", False),
+        )
+        self.assertEqual(client.requests.count("turns:full"), 1)
+        self.assertEqual(client.requests[-1], "turns:full")
+        self.assertGreaterEqual(client.requests.count("turns:notLoaded"), 3)
+        self.assertEqual(task_channel.outcome_exit_code("wait", result), 0)
+
+    async def test_explicit_turn_and_unknown_turn(self):
+        client = FakeWaitClient("idle", [agent_turn("b", "completed"), agent_turn("a", "completed", "old")])
+        result = await self.wait(client, "--turn", "a")
+        self.assertEqual((result["turnId"], result["lastAgentMessage"], result["alreadyIdle"]), ("a", "old", False))
+        with self.assertRaisesRegex(task_channel.ChannelError, "not found"):
+            await self.wait(client, "--turn", "zzz")
+
+    async def test_next_waits_for_a_new_turn(self):
+        def script(client):
+            if client.list_calls == 3:
+                client.turns.insert(0, {"id": "n", "status": "inProgress", "items": []})
+            if client.list_calls >= 5:
+                client.turns[0] = agent_turn("n", "completed", "next result")
+
+        client = FakeWaitClient("idle", [agent_turn("old", "completed")], script)
+        result = await self.wait(client, "--next", "--timeout", "5")
+        self.assertEqual((result["turnId"], result["lastAgentMessage"]), ("n", "next result"))
+        self.assertFalse(result["alreadyIdle"])
+
+    async def test_idle_without_next_returns_last_turn_immediately(self):
+        client = FakeWaitClient("idle", [agent_turn("b", "completed", "last"), agent_turn("a", "completed")])
+        result = await self.wait(client)
+        self.assertEqual((result["turnId"], result["lastAgentMessage"], result["alreadyIdle"]), ("b", "last", True))
+        self.assertNotIn("turn/start", client.requests)
+
+    async def test_not_loaded_task_has_no_active_turn_even_with_stale_in_progress(self):
+        client = FakeWaitClient("notLoaded", [{"id": "s", "status": "inProgress", "items": []}])
+        result = await self.wait(client, "--timeout", "0.5")
+        self.assertTrue(result["alreadyIdle"])
+        self.assertNotIn("timedOut", result)
+
+    async def test_wait_only_uses_read_only_rpcs(self):
+        client = FakeWaitClient("idle", [agent_turn("b", "completed")])
+        await self.wait(client)
+        self.assertEqual(set(client.requests) - {"thread/read", "turns:full", "turns:notLoaded"}, set())
+
+    async def test_disconnect_reconnects_and_returns_the_result(self):
+        def script(client):
+            if client.list_calls in (2, 3):
+                raise task_channel.ConnectionLost("gone")
+            if client.list_calls >= 4:
+                client.turns[0] = agent_turn("a", "completed", "after restart")
+
+        client = FakeWaitClient("active", [{"id": "a", "status": "inProgress", "items": []}], script)
+        result = await self.wait(client, "--timeout", "5")
+        self.assertEqual(result["lastAgentMessage"], "after restart")
+        self.assertEqual(client.reconnects, 2)
+
+    async def test_reconnect_failures_retry_until_the_deadline(self):
+        client = FakeWaitClient("active", [{"id": "a", "status": "inProgress", "items": []}])
+        client.list_turns = mock.AsyncMock(side_effect=task_channel.ConnectionLost("gone"))
+        client.reconnect = mock.AsyncMock(side_effect=task_channel.ConnectionLost("no socket"))
+        result = await task_channel.wait_for_terminal(client, "t", "a", 0.2)
+        self.assertTrue(result["timedOut"])
+        self.assertGreater(client.reconnect.await_count, 1)
+
+    async def test_logic_errors_are_not_retried(self):
+        client = FakeWaitClient("active", [])
+        client.list_turns = mock.AsyncMock(side_effect=task_channel.RpcError("thread/turns/list", {"code": -1}))
+        client.reconnect = mock.AsyncMock()
+        with self.assertRaises(task_channel.RpcError):
+            await task_channel.wait_for_terminal(client, "t", "a", 5)
+        client.reconnect.assert_not_awaited()
+        self.assertEqual(client.list_turns.await_count, 1)
+
+    async def test_send_wait_uses_the_hardened_wait(self):
+        def script(client):
+            if client.list_calls >= 3:
+                client.turns[0] = agent_turn("new", "completed", "pong")
+
+        client = FakeWaitClient("idle", [{"id": "new", "status": "inProgress", "items": []}], script)
+        args = task_channel.build_parser().parse_args(
+            ["send", "--thread", "t", "--mode", "start", "--message", "ping", "--wait"]
+        )
+        args.socket = Path("/app.sock")
+        client.read_thread = mock.AsyncMock(return_value={"turns": []})
+        with mock.patch.object(task_channel, "AppServerClient", return_value=client):
+            receipt = await task_channel.command_send(args)
+        self.assertEqual(receipt["terminal"]["lastAgentMessage"], "pong")
+        self.assertEqual(client.requests.count("turns:full"), 1)
+        self.assertIn("turns:notLoaded", client.requests)
+
+    async def test_closed_connection_fails_requests_as_connection_lost(self):
+        client = task_channel.AppServerClient(Path("/unused"))
+        websocket = FakeWebSocket()
+        client._ws = websocket
+        client._reader_task = asyncio.create_task(client._reader())
+        await websocket.close()
+        await client._reader_task
+        with self.assertRaises(task_channel.ConnectionLost):
+            await client.request("thread/read", {})
+
+
+class WaitMainTests(unittest.TestCase):
+    """Run through main(), which owns its event loop."""
+
+    def setUp(self):
+        for name, value in {"WAIT_POLL_MIN": 0.01, "WAIT_POLL_MAX": 0.02}.items():
+            patcher = mock.patch.object(task_channel, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_timeout_reports_running_task_and_exit_code(self):
+        client = FakeWaitClient("active", [{"id": "a", "status": "inProgress", "items": []}])
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(task_channel, "AppServerClient", return_value=client),
+            mock.patch("sys.stdout", out),
+            mock.patch("sys.stderr", err),
+        ):
+            code = task_channel.main(["wait", "--thread", "t", "--timeout", "0.1"])
+        self.assertEqual(code, task_channel.EXIT_WAIT_TIMEOUT)
+        result = json.loads(out.getvalue())["result"]
+        self.assertTrue(result["timedOut"])
+        self.assertEqual((result["threadId"], result["turnId"]), ("t", "a"))
+        self.assertIn("still running", result["note"])
+        self.assertIn("wait --thread t --turn a", result["note"])
+    def test_failed_and_interrupted_exit_codes_and_text_format(self):
+        for status, expected in (("failed", 3), ("interrupted", 4), ("completed", 0)):
+            client = FakeWaitClient("idle", [agent_turn("a", status, "x" * 50)])
+            out = io.StringIO()
+            with (
+                mock.patch.object(task_channel, "AppServerClient", return_value=client),
+                mock.patch("sys.stdout", out),
+            ):
+                code = task_channel.main(
+                    ["wait", "--thread", "t", "--turn", "a", "--format", "text", "--max-chars", "10"]
+                )
+            self.assertEqual(code, expected, status)
+            self.assertIn(f"status {status}", out.getvalue())
+            self.assertIn("[truncated, 50 chars]", out.getvalue())
+
+
+class WaitArgumentTests(unittest.TestCase):
+    def test_timeout_defaults_and_unlimited(self):
+        parser = task_channel.build_parser()
+        self.assertEqual(parser.parse_args(["wait", "--thread", "t"]).timeout, 3600)
+        self.assertEqual(parser.parse_args(["wait", "--thread", "t", "--timeout", "0"]).timeout, 0)
+        self.assertEqual(parser.parse_args(["wait", "--thread", "t"]).max_chars, 2000)
+        send = ["send", "--thread", "t", "--message", "m"]
+        self.assertEqual(parser.parse_args(send).wait_timeout, 3600)
+        self.assertEqual(parser.parse_args([*send, "--wait-timeout", "0"]).wait_timeout, 0)
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            parser.parse_args(["wait", "--thread", "t", "--timeout", "-1"])
+
+    def test_unlimited_timeout_has_no_deadline(self):
+        async def check():
+            self.assertIsNone(task_channel.deadline_after(0))
+            self.assertIsNotNone(task_channel.deadline_after(1))
+
+        asyncio.run(check())
+
+    def test_send_wait_outcomes_map_to_exit_codes(self):
+        code = lambda status, **extra: task_channel.outcome_exit_code("send", {"terminal": {"status": status, **extra}})
+        self.assertEqual(code("completed"), 0)
+        self.assertEqual(code("failed"), 3)
+        self.assertEqual(code("interrupted"), 4)
+        self.assertEqual(code("inProgress", timedOut=True), 5)
+        self.assertEqual(task_channel.outcome_exit_code("send", {"turnId": "x"}), 0)
 
 
 if __name__ == "__main__":
